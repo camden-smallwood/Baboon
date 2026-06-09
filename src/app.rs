@@ -32,10 +32,10 @@ use crate::source::{
     resolve_folder_root, scan_folder_subtree_entries,
 };
 
-pub(super) const GENESIS_GITHUB_URL: &str = "https://github.com/Zoephie/Genesis";
-pub(super) const GENESIS_LATEST_RELEASE_API: &str =
-    "https://api.github.com/repos/Zoephie/Genesis/releases/latest";
-pub(super) const GENESIS_RELEASES_URL: &str = "https://github.com/Zoephie/Genesis/releases";
+pub(super) const BABOON_GITHUB_URL: &str = "https://github.com/Zoephie/Baboon";
+pub(super) const BABOON_LATEST_RELEASE_API: &str =
+    "https://api.github.com/repos/Zoephie/Baboon/releases/latest";
+pub(super) const BABOON_RELEASES_URL: &str = "https://github.com/Zoephie/Baboon/releases";
 
 mod style;
 use style::*;
@@ -64,7 +64,7 @@ use editor::*;
 mod controller;
 mod ui;
 
-pub struct Genesis {
+pub struct Baboon {
     default_names: TagNameIndex,
     names: TagNameIndex,
     tx: Sender<WorkerMessage>,
@@ -134,7 +134,7 @@ pub struct Genesis {
     block_clipboard: Option<BlockClipboard>,
 }
 
-impl Genesis {
+impl Baboon {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_fonts(foundation_fonts());
         cc.egui_ctx.set_style(foundation_style());

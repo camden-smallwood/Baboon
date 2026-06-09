@@ -1,6 +1,6 @@
 use super::*;
 
-impl Genesis {
+impl Baboon {
     pub(super) fn process_worker_messages(&mut self) {
         while let Ok(message) = self.rx.try_recv() {
             match message {
@@ -1381,7 +1381,7 @@ impl Genesis {
     }
 }
 
-fn save_as_extension(app: &Genesis, entry: &TagEntry) -> Option<String> {
+fn save_as_extension(app: &Baboon, entry: &TagEntry) -> Option<String> {
     app.names
         .name_for(entry.group_tag)
         .or_else(|| group_tag_to_extension(entry.group_tag))
@@ -1510,7 +1510,7 @@ fn fetch_latest_release() -> Result<UpdateCheckResult, String> {
     }
 }
 
-const NO_PUBLIC_RELEASE_MESSAGE: &str = "No public Genesis releases found yet";
+const NO_PUBLIC_RELEASE_MESSAGE: &str = "No public Baboon releases found yet";
 
 #[cfg(target_os = "windows")]
 fn fetch_latest_release_powershell() -> Result<UpdateCheckResult, String> {
@@ -1519,7 +1519,7 @@ fn fetch_latest_release_powershell() -> Result<UpdateCheckResult, String> {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let script = format!(
         "$ErrorActionPreference = 'Stop'; \
-         $headers = @{{ 'User-Agent' = 'Genesis' }}; \
+         $headers = @{{ 'User-Agent' = 'Baboon' }}; \
          try {{ \
              $release = Invoke-RestMethod -UseBasicParsing -Headers $headers -Uri '{}'; \
              [Console]::Out.WriteLine($release.tag_name); \
@@ -1530,13 +1530,13 @@ fn fetch_latest_release_powershell() -> Result<UpdateCheckResult, String> {
                  $statusCode = [int]$_.Exception.Response.StatusCode; \
              }} \
              if ($statusCode -eq 404) {{ \
-                 [Console]::Out.WriteLine('__GENESIS_NO_PUBLIC_RELEASE__'); \
+                 [Console]::Out.WriteLine('__BABOON_NO_PUBLIC_RELEASE__'); \
                  exit 0; \
              }} \
              [Console]::Error.WriteLine($_.Exception.Message); \
              exit 1; \
          }}",
-        GENESIS_LATEST_RELEASE_API
+        BABOON_LATEST_RELEASE_API
     );
     let output = Command::new("powershell.exe")
         .creation_flags(CREATE_NO_WINDOW)
@@ -1560,8 +1560,8 @@ fn fetch_latest_release_curl() -> Result<UpdateCheckResult, String> {
             "-w",
             "\n%{http_code}",
             "-H",
-            "User-Agent: Genesis",
-            GENESIS_LATEST_RELEASE_API,
+            "User-Agent: Baboon",
+            BABOON_LATEST_RELEASE_API,
         ])
         .output()
         .map_err(|error| format!("Could not run curl: {error}"))?;
@@ -1593,7 +1593,7 @@ fn fetch_latest_release_curl() -> Result<UpdateCheckResult, String> {
         .get("html_url")
         .and_then(Value::as_str)
         .filter(|url| !url.trim().is_empty())
-        .unwrap_or(GENESIS_RELEASES_URL)
+        .unwrap_or(BABOON_RELEASES_URL)
         .to_owned();
     Ok(UpdateCheckResult {
         latest_tag,
@@ -1613,7 +1613,7 @@ fn parse_latest_release_lines(
     let text = String::from_utf8_lossy(stdout);
     let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
     let latest_tag = lines.next().unwrap_or_default().to_owned();
-    if latest_tag == "__GENESIS_NO_PUBLIC_RELEASE__" {
+    if latest_tag == "__BABOON_NO_PUBLIC_RELEASE__" {
         return Err(NO_PUBLIC_RELEASE_MESSAGE.to_owned());
     }
     if latest_tag.is_empty() {
@@ -1622,7 +1622,7 @@ fn parse_latest_release_lines(
     let release_url = lines
         .next()
         .filter(|url| !url.is_empty())
-        .unwrap_or(GENESIS_RELEASES_URL)
+        .unwrap_or(BABOON_RELEASES_URL)
         .to_owned();
     Ok(UpdateCheckResult {
         latest_tag,
@@ -1647,7 +1647,7 @@ fn update_check_status(result: &UpdateCheckResult) -> String {
             result.latest_tag, current, result.release_url
         )
     } else {
-        format!("Genesis is up to date ({current})")
+        format!("Baboon is up to date ({current})")
     }
 }
 

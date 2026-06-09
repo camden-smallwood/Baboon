@@ -23,19 +23,19 @@ struct IconEntry {
 }
 
 fn main() {
-    println!("cargo:rerun-if-changed=icons/Genesis.ico");
+    println!("cargo:rerun-if-changed=icons/Baboon.ico");
 
     if env::var_os("CARGO_CFG_WINDOWS").is_none() {
         return;
     }
 
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let ico_path = manifest_dir.join("icons").join("Genesis.ico");
+    let ico_path = manifest_dir.join("icons").join("Baboon.ico");
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    let res_path = out_dir.join("Genesis.res");
+    let res_path = out_dir.join("Baboon.res");
 
-    write_icon_resource(&ico_path, &res_path).expect("write Genesis icon resource");
-    println!("cargo:rustc-link-arg-bin=Genesis={}", res_path.display());
+    write_icon_resource(&ico_path, &res_path).expect("write Baboon icon resource");
+    println!("cargo:rustc-link-arg-bin=Baboon={}", res_path.display());
 }
 
 fn write_icon_resource(ico_path: &Path, res_path: &Path) -> io::Result<()> {

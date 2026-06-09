@@ -466,14 +466,22 @@ pub fn scan_folder_subtree_entries(
 /// Derive a stable index filename from the game name stored in `FolderRootInfo`.
 /// e.g. "halo3_mcc" → `halo3_mcc_index.json`.
 pub fn index_path(game: &str) -> PathBuf {
+    app_index_path(game, "Baboon", "baboon")
+}
+
+fn legacy_index_path(game: &str) -> PathBuf {
+    app_index_path(game, "Genesis", "genesis")
+}
+
+fn app_index_path(game: &str, windows_folder: &str, unix_folder: &str) -> PathBuf {
     let filename = format!("{game}_index.json");
     if let Some(appdata) = std::env::var_os("APPDATA") {
-        return PathBuf::from(appdata).join("Genesis").join(filename);
+        return PathBuf::from(appdata).join(windows_folder).join(filename);
     }
     if let Some(home) = std::env::var_os("USERPROFILE") {
         return PathBuf::from(home)
             .join(".config")
-            .join("genesis")
+            .join(unix_folder)
             .join(filename);
     }
     PathBuf::from(filename)
@@ -512,8 +520,9 @@ pub fn save_entry_index(game: &str, root: &Path, entries: &[TagEntry]) -> Result
 /// it can't be parsed, or it was saved for a different `root` folder (the keys
 /// are absolute paths, so the index is only valid for its original root).
 pub fn load_entry_index(game: &str, root: &Path) -> Option<Vec<TagEntry>> {
-    let path = index_path(game);
-    let text = std::fs::read_to_string(&path).ok()?;
+    let text = std::fs::read_to_string(index_path(game))
+        .or_else(|_| std::fs::read_to_string(legacy_index_path(game)))
+        .ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     // Reject an index saved for a different root folder.
     let saved_root = value.get("root").and_then(|v| v.as_str())?;

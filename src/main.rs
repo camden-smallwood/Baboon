@@ -12,7 +12,7 @@ fn main() -> Result<()> {
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_inner_size([1280.0, 800.0])
         .with_min_inner_size([900.0, 560.0])
-        .with_title("Genesis");
+        .with_title("Baboon");
     if let Some(icon) = app_icon() {
         viewport = viewport.with_icon(icon);
     }
@@ -24,16 +24,16 @@ fn main() -> Result<()> {
     };
 
     eframe::run_native(
-        "Genesis",
+        "Baboon",
         native_options,
-        Box::new(|cc| Ok(Box::new(app::Genesis::new(cc)))),
+        Box::new(|cc| Ok(Box::new(app::Baboon::new(cc)))),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 fn app_icon() -> Option<eframe::egui::IconData> {
     let image = image::load_from_memory_with_format(
-        include_bytes!("../icons/Genesis.ico"),
+        include_bytes!("../icons/Baboon.ico"),
         image::ImageFormat::Ico,
     )
     .ok()?

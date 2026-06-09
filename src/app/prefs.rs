@@ -1,20 +1,36 @@
 use super::*;
 
 pub(super) fn prefs_path() -> PathBuf {
+    app_prefs_path("Baboon", "baboon", ".baboon-prefs.json")
+}
+
+fn legacy_prefs_path() -> PathBuf {
+    app_prefs_path("Genesis", "genesis", ".genesis-prefs.json")
+}
+
+fn app_prefs_path(windows_folder: &str, unix_folder: &str, fallback_name: &str) -> PathBuf {
     if let Some(appdata) = std::env::var_os("APPDATA") {
-        return PathBuf::from(appdata).join("Genesis").join("prefs.json");
+        return PathBuf::from(appdata)
+            .join(windows_folder)
+            .join("prefs.json");
     }
     if let Some(home) = std::env::var_os("USERPROFILE") {
         return PathBuf::from(home)
             .join(".config")
-            .join("genesis")
+            .join(unix_folder)
             .join("prefs.json");
     }
-    PathBuf::from(".genesis-prefs.json")
+    PathBuf::from(fallback_name)
+}
+
+fn read_prefs_text() -> Option<String> {
+    fs::read_to_string(prefs_path())
+        .or_else(|_| fs::read_to_string(legacy_prefs_path()))
+        .ok()
 }
 
 pub(super) fn load_gui_prefs() -> GuiPrefs {
-    let Ok(text) = fs::read_to_string(prefs_path()) else {
+    let Some(text) = read_prefs_text() else {
         return GuiPrefs::default();
     };
     let Ok(value) = serde_json::from_str::<Value>(&text) else {
@@ -81,7 +97,7 @@ pub(super) fn save_gui_prefs(
 /// Load the set of game identifiers for which the terminal should auto-open.
 /// Reads the same prefs.json as `load_gui_prefs`.
 pub(super) fn load_terminal_open_games() -> HashSet<String> {
-    let Ok(text) = fs::read_to_string(prefs_path()) else {
+    let Some(text) = read_prefs_text() else {
         return HashSet::new();
     };
     let Ok(value) = serde_json::from_str::<Value>(&text) else {

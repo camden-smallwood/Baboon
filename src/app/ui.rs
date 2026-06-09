@@ -24,7 +24,7 @@ fn launcher_button(
     }
 }
 
-impl Genesis {
+impl Baboon {
     /// "Search fields" bar (Guerilla-style): typing a block or field name
     /// collapses the editor to just the matching node(s) and their ancestors.
     pub(super) fn draw_field_search_bar(&mut self, ui: &mut Ui, tag_key: &str) {
@@ -143,8 +143,8 @@ impl Genesis {
         }
 
         let mut open = self.about_open;
-        egui::Window::new("Genesis Help")
-            .id(egui::Id::new("genesis_help"))
+        egui::Window::new("Baboon Help")
+            .id(egui::Id::new("baboon_help"))
             .collapsible(false)
             .resizable(true)
             .open(&mut open)
@@ -173,7 +173,7 @@ impl Genesis {
 }
 
 fn draw_about_tab(ui: &mut Ui) {
-    ui.heading(RichText::new("Genesis").color(text_dark()));
+    ui.heading(RichText::new("Baboon").color(text_dark()));
     ui.label(RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).color(subtle_dark()));
     ui.add_space(8.0);
     ui.separator();
@@ -187,7 +187,7 @@ fn draw_about_tab(ui: &mut Ui) {
         );
     });
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Genesis created by").color(text_dark()));
+        ui.label(RichText::new("Baboon created by").color(text_dark()));
         ui.label(
             RichText::new("Zoephie Sinyard")
                 .color(foundation_blue())
@@ -198,7 +198,7 @@ fn draw_about_tab(ui: &mut Ui) {
     ui.separator();
     ui.add_space(8.0);
     ui.label(RichText::new("Source").color(text_dark()).strong());
-    ui.hyperlink_to(GENESIS_GITHUB_URL, GENESIS_GITHUB_URL);
+    ui.hyperlink_to(BABOON_GITHUB_URL, BABOON_GITHUB_URL);
 }
 
 fn draw_doc_tab(ui: &mut Ui) {
@@ -210,8 +210,8 @@ fn draw_doc_tab(ui: &mut Ui) {
                 "Load Folder",
                 &[
                     "Use File > Load Folder to choose the root of your editing kit, such as H3EK, HREK, H4EK, H3ODSTEK, or H2AMPEK/H2AEK.",
-                    "Genesis will load the kit's tags folder from that root. Picking the kit root also lets the terminal, launcher buttons, and tool import commands resolve the correct working directory.",
-                    "Choosing the tags folder directly works for browsing tags, but the kit root is the safest habit when you want Genesis to work with external tools.",
+                    "Baboon will load the kit's tags folder from that root. Picking the kit root also lets the terminal, launcher buttons, and tool import commands resolve the correct working directory.",
+                    "Choosing the tags folder directly works for browsing tags, but the kit root is the safest habit when you want Baboon to work with external tools.",
                 ],
             );
             doc_section(
@@ -248,7 +248,7 @@ fn draw_doc_tab(ui: &mut Ui) {
                 &[
                     "Tag-reference rows for render_model, collision_model, physics_model, and model_animation_graph can show an Import button.",
                     "Import runs the matching editing-kit tool command from the kit root, so it needs a loaded editing-kit folder.",
-                    "For animation graphs, Genesis uses the model-animations-uncompressed tool command.",
+                    "For animation graphs, Baboon uses the model-animations-uncompressed tool command.",
                 ],
             );
         });
@@ -275,7 +275,7 @@ fn doc_section(ui: &mut Ui, title: &str, lines: &[&str]) {
     ui.add_space(12.0);
 }
 
-impl eframe::App for Genesis {
+impl eframe::App for Baboon {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_worker_messages();
         set_dark_mode(self.dark_mode);

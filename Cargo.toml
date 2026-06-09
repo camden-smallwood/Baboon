@@ -6,14 +6,14 @@ members = [".", "blam-tags/blam-tag-shell"]
 default-members = [".", "blam-tags/blam-tag-shell"]
 
 [package]
-name = "genesis"
+name = "baboon"
 version = "0.1.1"
 edition = "2024"
 build = "build.rs"
-default-run = "Genesis"
+default-run = "Baboon"
 
 [[bin]]
-name = "Genesis"
+name = "Baboon"
 path = "src/main.rs"
 
 [dependencies]

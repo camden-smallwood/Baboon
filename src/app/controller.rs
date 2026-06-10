@@ -897,6 +897,7 @@ impl Baboon {
             double_click_to_open_tags: self.double_click_to_open_tags,
             expert_mode: self.expert_mode,
             dark_mode: self.dark_mode,
+            model_preview_size: self.model_preview_size,
             blender_path: self.blender_path.clone(),
         }
     }
@@ -1251,6 +1252,7 @@ impl Baboon {
                     let mut block_ops = Vec::new();
                     let mut shader_ops = Vec::new();
                     let mut shader_param_ops = Vec::new();
+                    let mut model_variant_ops = Vec::new();
                     let mut bitmap_reimport = None;
                     let field_filter = compute_pending_field_filter(
                         &doc.tag,
@@ -1282,6 +1284,7 @@ impl Baboon {
                         bitmap_reimport: &mut bitmap_reimport,
                         shader_ops: &mut shader_ops,
                         shader_param_ops: &mut shader_param_ops,
+                        model_variant_ops: &mut model_variant_ops,
                         color_request: &mut color_request,
                         block_clipboard: self.block_clipboard.as_ref(),
                         block_clip_request: &mut block_clip_request,
@@ -1301,7 +1304,13 @@ impl Baboon {
                             &mut edit_context,
                         );
                     } else {
-                        let model_preview = self.model_previews.entry(key.clone()).or_default();
+                        let mut local_model_preview;
+                        let model_preview = if is_model_group(entry.group_tag, &self.names) {
+                            self.model_previews.entry(key.clone()).or_default()
+                        } else {
+                            local_model_preview = ModelPreviewState::default();
+                            &mut local_model_preview
+                        };
                         draw_tag(
                             ui,
                             &doc.tag,
@@ -1313,6 +1322,7 @@ impl Baboon {
                             &mut self.color_popup,
                             &mut self.function_popup,
                             model_preview,
+                            &mut self.model_preview_size,
                             self.expert_mode,
                             &mut edit_context,
                         );
@@ -1329,6 +1339,15 @@ impl Baboon {
                         apply_shader_param_ops(&mut doc.tag, shader_param_ops, &mut doc.dirty)
                     {
                         edit_status = Some(status);
+                    }
+                    if let Some(status) =
+                        apply_model_variant_ops(&mut doc.tag, model_variant_ops, &mut doc.dirty)
+                    {
+                        edit_status = Some(status);
+                        if let Some(preview) = self.model_previews.get_mut(&key) {
+                            preview.loaded_key = None;
+                            preview.data = None;
+                        }
                     }
                     // A color swatch was clicked: open the shared picker.
                     if let Some(popup) = color_request {

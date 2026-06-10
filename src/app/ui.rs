@@ -100,6 +100,29 @@ impl Baboon {
                 );
                 ui.add_space(10.0);
 
+                ui.label(RichText::new("Appearance").color(text_dark()).strong());
+                ui.add_space(4.0);
+                ui.checkbox(&mut self.dark_mode, "Dark mode");
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Model viewport").color(subtle_dark()));
+                    ui.add(
+                        egui::Slider::new(
+                            &mut self.model_preview_size,
+                            MIN_MODEL_PREVIEW_SIZE..=MAX_MODEL_PREVIEW_SIZE,
+                        )
+                        .show_value(false)
+                        .clamping(egui::SliderClamping::Always),
+                    );
+                    ui.label(
+                        RichText::new(format!("{:.0}%", self.model_preview_size * 100.0))
+                            .color(subtle_dark()),
+                    );
+                    if ui.button("Reset").clicked() {
+                        self.model_preview_size = DEFAULT_MODEL_PREVIEW_SIZE;
+                    }
+                });
+                ui.add_space(10.0);
+
                 ui.label(RichText::new("Blender").color(text_dark()).strong());
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
@@ -231,6 +254,24 @@ fn draw_doc_tab(ui: &mut Ui) {
                     "Right-click a block name in the editor header to copy and paste block data.",
                     "Copy element copies the selected block entry. Copy entire block copies every entry in that block.",
                     "Paste, Replace selected element, and Replace entire block appear when the clipboard is compatible with the current tag group and block path.",
+                ],
+            );
+            doc_section(
+                ui,
+                "Appearance Settings",
+                &[
+                    "Use File > Settings > Appearance to switch Dark mode on or off.",
+                    "Dark mode is saved in Baboon's preferences, so it stays set the next time you launch the app.",
+                    "The same Appearance section also has the default Model viewport size used by .model render previews.",
+                ],
+            );
+            doc_section(
+                ui,
+                "Model Render View",
+                &[
+                    "Open a .model tag and choose the Render model tab to inspect the referenced render_model without scrolling through the field tree.",
+                    "The Viewport slider in the render tab scales the preview from 80% to 260%; the value is global and saved in preferences.",
+                    "If the preview becomes too wide for the editor panel, the region and variant controls move below it automatically.",
                 ],
             );
             doc_section(
@@ -373,7 +414,6 @@ impl eframe::App for Baboon {
                         ui.separator();
                         ui.checkbox(&mut self.show_browser_prefixes, "Show [tag]/[folder]");
                         ui.checkbox(&mut self.expert_mode, "Expert mode");
-                        ui.checkbox(&mut self.dark_mode, "Dark mode");
                         ui.separator();
                         let terminal_enabled = self.terminal_work_dir.is_some();
                         if ui
@@ -971,6 +1011,7 @@ impl eframe::App for Baboon {
                         let mut block_ops = Vec::new();
                         let mut shader_ops = Vec::new();
                         let mut shader_param_ops = Vec::new();
+                        let mut model_variant_ops = Vec::new();
                         let mut color_request = None;
                         let mut block_clip_request = None;
                         let mut bitmap_reimport = None;
@@ -1001,6 +1042,7 @@ impl eframe::App for Baboon {
                             bitmap_reimport: &mut bitmap_reimport,
                             shader_ops: &mut shader_ops,
                             shader_param_ops: &mut shader_param_ops,
+                            model_variant_ops: &mut model_variant_ops,
                             color_request: &mut color_request,
                             block_clipboard: self.block_clipboard.as_ref(),
                             block_clip_request: &mut block_clip_request,
@@ -1023,8 +1065,13 @@ impl eframe::App for Baboon {
                                 &mut edit_context,
                             );
                         } else {
-                            let model_preview =
-                                self.model_previews.entry(selected_key.clone()).or_default();
+                            let mut local_model_preview;
+                            let model_preview = if is_model_group(entry.group_tag, &self.names) {
+                                self.model_previews.entry(selected_key.clone()).or_default()
+                            } else {
+                                local_model_preview = ModelPreviewState::default();
+                                &mut local_model_preview
+                            };
                             draw_tag(
                                 ui,
                                 &doc.tag,
@@ -1036,6 +1083,7 @@ impl eframe::App for Baboon {
                                 &mut self.color_popup,
                                 &mut self.function_popup,
                                 model_preview,
+                                &mut self.model_preview_size,
                                 self.expert_mode,
                                 &mut edit_context,
                             );
@@ -1059,6 +1107,15 @@ impl eframe::App for Baboon {
                             apply_shader_param_ops(&mut doc.tag, shader_param_ops, &mut doc.dirty)
                         {
                             self.status = status;
+                        }
+                        if let Some(status) =
+                            apply_model_variant_ops(&mut doc.tag, model_variant_ops, &mut doc.dirty)
+                        {
+                            self.status = status;
+                            if let Some(preview) = self.model_previews.get_mut(&selected_key) {
+                                preview.loaded_key = None;
+                                preview.data = None;
+                            }
                         }
                         // A color swatch was clicked: open the shared picker.
                         if let Some(popup) = color_request {

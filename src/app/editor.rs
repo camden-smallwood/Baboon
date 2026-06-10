@@ -23,19 +23,87 @@ pub(super) fn draw_tag(
     color_popup: &mut Option<MaterialColorPopup>,
     function_popup: &mut Option<FunctionPopup>,
     model_preview: &mut ModelPreviewState,
+    model_preview_size: &mut f32,
     expert_mode: bool,
     edit: &mut FieldEditContext<'_>,
 ) {
-    draw_tag_metadata(ui, tag, names);
     let is_object_family = is_object_family_group(entry.group_tag);
+    let is_shaderish =
+        is_material_tag(entry) || is_material_shader_tag(entry) || is_shader_tag(entry);
+    let is_model = is_model_group(entry.group_tag, names);
+
+    draw_tag_metadata(ui, tag, names);
     if !is_object_family {
         draw_object_model_summary(ui, tag, entry, names, edit);
     }
-    draw_model_preview_panel(ui, tag, entry, names, source, model_preview);
+
+    if is_model {
+        draw_model_tag_panel_tabs(ui, model_preview);
+    }
     ui.add_space(6.0);
 
-    let is_shaderish =
-        is_material_tag(entry) || is_material_shader_tag(entry) || is_shader_tag(entry);
+    if is_model && model_preview.active_tab == ModelTagPanelTab::RenderModel {
+        draw_model_preview_panel(
+            ui,
+            tag,
+            entry,
+            names,
+            source,
+            model_preview,
+            model_preview_size,
+            edit,
+        );
+        return;
+    }
+
+    draw_tag_fields_scroll(
+        ui,
+        tag,
+        entry,
+        names,
+        source,
+        rmdf_cache,
+        rmop_cache,
+        color_popup,
+        function_popup,
+        expert_mode,
+        edit,
+        is_object_family,
+        is_shaderish,
+    );
+}
+
+fn draw_model_tag_panel_tabs(ui: &mut Ui, model_preview: &mut ModelPreviewState) {
+    ui.horizontal(|ui| {
+        ui.selectable_value(
+            &mut model_preview.active_tab,
+            ModelTagPanelTab::Fields,
+            "Fields",
+        );
+        ui.selectable_value(
+            &mut model_preview.active_tab,
+            ModelTagPanelTab::RenderModel,
+            "Render model",
+        );
+    });
+}
+
+fn draw_tag_fields_scroll(
+    ui: &mut Ui,
+    tag: &TagFile,
+    entry: &TagEntry,
+    names: &TagNameIndex,
+    source: Option<&TagSource>,
+    rmdf_cache: &mut HashMap<String, Option<RenderMethodDefinition>>,
+    rmop_cache: &mut HashMap<String, Option<RenderMethodOption>>,
+    color_popup: &mut Option<MaterialColorPopup>,
+    function_popup: &mut Option<FunctionPopup>,
+    expert_mode: bool,
+    edit: &mut FieldEditContext<'_>,
+    is_object_family: bool,
+    is_shaderish: bool,
+) {
+    let scroll_height = ui.available_height().max(0.0);
     if is_shaderish {
         // The Guerilla-style shader grid is the single editing surface — no
         // separate field tab. The grid's bitmap/scalar/int/function/category
@@ -43,6 +111,7 @@ pub(super) fn draw_tag(
         // back to the standard editable field tree (inside draw_material_tag).
         ScrollArea::vertical()
             .id_salt(("tag_scroll", edit.view_scope, edit.tag_key))
+            .max_height(scroll_height)
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 draw_material_tag(
@@ -64,6 +133,7 @@ pub(super) fn draw_tag(
 
     ScrollArea::vertical()
         .id_salt(("tag_scroll", edit.view_scope, edit.tag_key))
+        .max_height(scroll_height)
         .auto_shrink([false, false])
         .show(ui, |ui| {
             if is_object_family {
@@ -368,6 +438,119 @@ pub(super) fn apply_shader_param_ops(
         }
     }
     status
+}
+
+pub(super) fn apply_model_variant_ops(
+    tag: &mut TagFile,
+    ops: Vec<ModelVariantOp>,
+    dirty: &mut bool,
+) -> Option<String> {
+    let mut status = None;
+    for op in ops {
+        match apply_one_model_variant_op(tag, &op) {
+            Ok(msg) => {
+                *dirty = true;
+                status = Some(msg);
+            }
+            Err(error) => {
+                status = Some(format!("Model variant edit failed: {error}"));
+            }
+        }
+    }
+    status
+}
+
+fn apply_one_model_variant_op(tag: &mut TagFile, op: &ModelVariantOp) -> Result<String, String> {
+    match op {
+        ModelVariantOp::Create { name, regions } => {
+            let variant_index = add_block_element(tag, "variants")?;
+            apply_field_edit(tag, &format!("variants[{variant_index}]/name"), name)?;
+            write_model_variant_regions(tag, variant_index, regions)?;
+            Ok(format!("Created model variant '{name}'"))
+        }
+        ModelVariantOp::Update {
+            variant_index,
+            regions,
+        } => {
+            ensure_block_element_exists(tag, "variants", *variant_index)?;
+            write_model_variant_regions(tag, *variant_index, regions)?;
+            Ok(format!("Updated model variant {}", variant_index))
+        }
+        ModelVariantOp::Drop { variant_index } => {
+            let mut root = tag.root_mut();
+            let mut field = root
+                .field_path_mut("variants")
+                .ok_or_else(|| "variants block not found".to_owned())?;
+            let mut block = field
+                .as_block_mut()
+                .ok_or_else(|| "variants is not a block".to_owned())?;
+            block
+                .delete_element(*variant_index)
+                .map_err(|e| format!("{e:?}"))?;
+            Ok(format!("Deleted model variant {}", variant_index))
+        }
+    }
+}
+
+fn write_model_variant_regions(
+    tag: &mut TagFile,
+    variant_index: usize,
+    regions: &[ModelVariantRegionChoice],
+) -> Result<(), String> {
+    let regions_path = format!("variants[{variant_index}]/regions");
+    clear_block(tag, &regions_path)?;
+    for region in regions {
+        let region_index = add_block_element(tag, &regions_path)?;
+        apply_field_edit(
+            tag,
+            &format!("{regions_path}[{region_index}]/region name"),
+            &region.region_name,
+        )?;
+        let permutations_path = format!("{regions_path}[{region_index}]/permutations");
+        let permutation_index = add_block_element(tag, &permutations_path)?;
+        apply_field_edit(
+            tag,
+            &format!("{permutations_path}[{permutation_index}]/permutation name"),
+            &region.permutation_name,
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_block_element_exists(tag: &TagFile, path: &str, index: usize) -> Result<(), String> {
+    let block = tag
+        .root()
+        .field_path(path)
+        .and_then(|field| field.as_block())
+        .ok_or_else(|| format!("{path} block not found"))?;
+    if index < block.len() {
+        Ok(())
+    } else {
+        Err(format!("{path}[{index}] is out of range"))
+    }
+}
+
+fn add_block_element(tag: &mut TagFile, path: &str) -> Result<usize, String> {
+    let mut root = tag.root_mut();
+    let mut field = root
+        .field_path_mut(path)
+        .ok_or_else(|| format!("{path} block not found"))?;
+    let mut block = field
+        .as_block_mut()
+        .ok_or_else(|| format!("{path} is not a block"))?;
+    Ok(block.add_element())
+}
+
+fn clear_block(tag: &mut TagFile, path: &str) -> Result<(), String> {
+    let mut root = tag.root_mut();
+    let mut field = root
+        .field_path_mut(path)
+        .ok_or_else(|| format!("{path} block not found"))?;
+    let mut block = field
+        .as_block_mut()
+        .ok_or_else(|| format!("{path} is not a block"))?;
+    block.clear();
+    Ok(())
 }
 
 pub(super) fn apply_one_shader_param_op(

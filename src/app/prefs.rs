@@ -58,6 +58,12 @@ pub(super) fn load_gui_prefs() -> GuiPrefs {
             .get("dark_mode")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        model_preview_size: value
+            .get("model_preview_size")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32)
+            .unwrap_or(DEFAULT_MODEL_PREVIEW_SIZE)
+            .clamp(MIN_MODEL_PREVIEW_SIZE, MAX_MODEL_PREVIEW_SIZE),
         blender_path: value
             .get("blender_path")
             .and_then(Value::as_str)
@@ -86,6 +92,7 @@ pub(super) fn save_gui_prefs(
         "double_click_to_open_tags": prefs.double_click_to_open_tags,
         "expert_mode": prefs.expert_mode,
         "dark_mode": prefs.dark_mode,
+        "model_preview_size": prefs.model_preview_size,
         "blender_path": prefs.blender_path.as_ref().map(|path| path.display().to_string()),
         "terminal_open_games": games,
     });

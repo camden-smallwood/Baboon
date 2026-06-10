@@ -193,7 +193,7 @@ launch.
 ## Technical overview
 
 - **Language / edition** — Rust 2024.
-- **UI** — [`eframe`/`egui`] (immediate-mode GUI) with the `wgpu`
+- **UI** — [`eframe`/`egui`] (immediate-mode GUI) with the `glow` (OpenGL)
   backend and bundled default fonts. Native file dialogs via [`rfd`].
 - **Engine** — the [`blam-tags`] crate, linked by path, provides all binary tag
   parsing/serialisation, bitmap decoding, geometry export (JMS/ASS), render-

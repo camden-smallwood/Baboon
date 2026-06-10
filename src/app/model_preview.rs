@@ -7,6 +7,8 @@ pub(super) fn draw_model_preview_panel(
     names: &TagNameIndex,
     source: Option<&TagSource>,
     state: &mut ModelPreviewState,
+    model_preview_size: &mut f32,
+    edit: &mut FieldEditContext<'_>,
 ) {
     let is_model = is_model_group(entry.group_tag, names);
     if !is_model {
@@ -35,6 +37,19 @@ pub(super) fn draw_model_preview_panel(
                 ui.checkbox(&mut state.show_markers, "Markers");
                 ui.checkbox(&mut state.show_wireframe, "Wireframe");
                 ui.checkbox(&mut state.show_backfaces, "Backfaces");
+                ui.label(RichText::new("Viewport").color(subtle_dark()));
+                ui.add(
+                    egui::Slider::new(
+                        model_preview_size,
+                        MIN_MODEL_PREVIEW_SIZE..=MAX_MODEL_PREVIEW_SIZE,
+                    )
+                    .show_value(false)
+                    .clamping(egui::SliderClamping::Always),
+                );
+                ui.label(
+                    RichText::new(format!("{:.0}%", *model_preview_size * 100.0))
+                        .color(subtle_dark()),
+                );
                 if ui.button("Refresh model").clicked() {
                     state.loaded_key = None;
                     state.data = None;
@@ -56,27 +71,60 @@ pub(super) fn draw_model_preview_panel(
                 }
             };
 
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    let width = ui.available_width().min(470.0).max(280.0);
-                    draw_model_viewport(ui, data, state, Vec2::new(width, 300.0));
-                    ui.small(
-                        RichText::new(format!(
-                            "{} vertices, {} triangles",
-                            data.preview.vertices.len(),
-                            data.preview.indices.len() / 3
-                        ))
-                        .color(subtle_dark()),
-                    );
+            let mut mutation_requested = false;
+            let desired_viewport = model_viewport_size(ui.available_width(), *model_preview_size);
+            let can_place_controls_beside = ui.available_width() >= desired_viewport.x + 360.0;
+            if can_place_controls_beside {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        draw_model_viewport_with_stats(ui, data, state, desired_viewport)
+                    });
+                    ui.add_space(10.0);
+                    ui.vertical(|ui| {
+                        if draw_variant_controls(ui, data, state, edit) {
+                            mutation_requested = true;
+                        }
+                    });
                 });
-                ui.add_space(10.0);
-                ui.vertical(|ui| {
-                    draw_variant_controls(ui, data, state);
-                });
-            });
-            state.data = restore_data.take();
+            } else {
+                draw_model_viewport_with_stats(ui, data, state, desired_viewport);
+                ui.add_space(8.0);
+                if draw_variant_controls(ui, data, state, edit) {
+                    mutation_requested = true;
+                }
+            }
+            if mutation_requested {
+                state.loaded_key = None;
+                state.data = None;
+            } else {
+                state.data = restore_data.take();
+            }
         });
     ui.add_space(8.0);
+}
+
+fn model_viewport_size(available_width: f32, model_preview_size: f32) -> Vec2 {
+    let scale = model_preview_size.clamp(MIN_MODEL_PREVIEW_SIZE, MAX_MODEL_PREVIEW_SIZE);
+    let desired = Vec2::new(470.0 * scale, 300.0 * scale);
+    let width = desired.x.min(available_width.max(280.0)).max(280.0);
+    Vec2::new(width, desired.y * (width / desired.x))
+}
+
+fn draw_model_viewport_with_stats(
+    ui: &mut Ui,
+    data: &ModelPreviewData,
+    state: &mut ModelPreviewState,
+    desired_size: Vec2,
+) {
+    draw_model_viewport(ui, data, state, desired_size);
+    ui.small(
+        RichText::new(format!(
+            "{} vertices, {} triangles",
+            data.preview.vertices.len(),
+            data.preview.indices.len() / 3
+        ))
+        .color(subtle_dark()),
+    );
 }
 
 fn ensure_model_preview_loaded(
@@ -227,7 +275,13 @@ fn reset_model_preview_selection(
     }
 }
 
-fn draw_variant_controls(ui: &mut Ui, data: &ModelPreviewData, state: &mut ModelPreviewState) {
+fn draw_variant_controls(
+    ui: &mut Ui,
+    data: &ModelPreviewData,
+    state: &mut ModelPreviewState,
+    edit: &mut FieldEditContext<'_>,
+) -> bool {
+    let mut mutation_requested = false;
     ui.horizontal(|ui| {
         ui.label(RichText::new("Variant").color(subtle_dark()));
         let selected = state
@@ -289,17 +343,108 @@ fn draw_variant_controls(ui: &mut Ui, data: &ModelPreviewData, state: &mut Model
 
     ui.add_space(8.0);
     ui.horizontal_wrapped(|ui| {
-        for label in [
-            "Create new variant from selection...",
-            "Update existing variant from selection...",
-            "Drop Variant",
-            "Drop Permutation",
-            "Update",
-        ] {
-            ui.add_enabled(false, egui::Button::new(label))
-                .on_hover_text("Variant writing is deferred to the model preview V2 pass.");
+        ui.label(RichText::new("New variant").color(subtle_dark()));
+        ui.add_enabled(
+            edit.editable,
+            egui::TextEdit::singleline(&mut state.new_variant_name).desired_width(130.0),
+        );
+        let chosen_regions = selected_variant_regions(data, state);
+        let create_name = normalized_new_variant_name(data, state);
+        let can_create = edit.editable && create_name.is_some() && !chosen_regions.is_empty();
+        if ui
+            .add_enabled(
+                can_create,
+                egui::Button::new("Create new variant from selection..."),
+            )
+            .on_hover_text("Create a .model variant using the visible region selections.")
+            .clicked()
+        {
+            let name = create_name.expect("button enabled only when name is valid");
+            edit.model_variant_ops.push(ModelVariantOp::Create {
+                name,
+                regions: chosen_regions.clone(),
+            });
+            state.new_variant_name.clear();
+            mutation_requested = true;
+        }
+        let can_update =
+            edit.editable && state.selected_variant.is_some() && !chosen_regions.is_empty();
+        if ui
+            .add_enabled(
+                can_update,
+                egui::Button::new("Update existing variant from selection..."),
+            )
+            .on_hover_text("Replace the selected variant's region permutations.")
+            .clicked()
+        {
+            edit.model_variant_ops.push(ModelVariantOp::Update {
+                variant_index: state
+                    .selected_variant
+                    .expect("button enabled only when a variant is selected"),
+                regions: chosen_regions,
+            });
+            mutation_requested = true;
+        }
+        let can_drop = edit.editable && state.selected_variant.is_some();
+        if ui
+            .add_enabled(can_drop, egui::Button::new("Drop Variant"))
+            .on_hover_text("Delete the selected variant from the .model tag.")
+            .clicked()
+        {
+            edit.model_variant_ops.push(ModelVariantOp::Drop {
+                variant_index: state
+                    .selected_variant
+                    .expect("button enabled only when a variant is selected"),
+            });
+            state.selected_variant = None;
+            mutation_requested = true;
         }
     });
+    mutation_requested
+}
+
+fn selected_variant_regions(
+    data: &ModelPreviewData,
+    state: &ModelPreviewState,
+) -> Vec<ModelVariantRegionChoice> {
+    data.preview
+        .regions
+        .iter()
+        .filter_map(|region| {
+            let selection = state.region_selections.get(&region.name)?;
+            if !selection.enabled
+                || selection.permutation.is_empty()
+                || !region
+                    .permutations
+                    .iter()
+                    .any(|p| p == &selection.permutation)
+            {
+                return None;
+            }
+            Some(ModelVariantRegionChoice {
+                region_name: region.name.clone(),
+                permutation_name: selection.permutation.clone(),
+            })
+        })
+        .collect()
+}
+
+fn normalized_new_variant_name(
+    data: &ModelPreviewData,
+    state: &ModelPreviewState,
+) -> Option<String> {
+    let name = state.new_variant_name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    if data
+        .variants
+        .iter()
+        .any(|variant| variant.name.eq_ignore_ascii_case(name))
+    {
+        return None;
+    }
+    Some(name.to_owned())
 }
 
 fn draw_model_viewport(
@@ -313,7 +458,9 @@ fn draw_model_viewport(
     painter.rect_filled(rect, 0.0, Color32::from_rgb(228, 238, 244));
     painter.rect_stroke(rect, 0.0, Stroke::new(1.0, foundation_input_edge()));
 
-    if response.dragged() {
+    if response.dragged_by(egui::PointerButton::Middle) {
+        state.pan += response.drag_delta();
+    } else if response.dragged_by(egui::PointerButton::Primary) {
         let delta = response.drag_delta();
         if ui.input(|i| i.modifiers.shift) {
             state.pan += delta;
@@ -346,8 +493,8 @@ fn draw_model_viewport(
     mesh.indices.reserve(state.projected_triangles.len() * 3);
     for tri in &state.projected_triangles {
         let start = mesh.vertices.len() as u32;
-        for point in tri.points {
-            mesh.colored_vertex(point, tri.fill);
+        for (point, fill) in tri.points.into_iter().zip(tri.fills) {
+            mesh.colored_vertex(point, fill);
         }
         mesh.add_triangle(start, start + 1, start + 2);
     }
@@ -362,17 +509,34 @@ fn draw_model_viewport(
     }
 
     if state.show_markers {
+        let hover_pos = if response.hovered() {
+            ui.input(|i| i.pointer.hover_pos())
+        } else {
+            None
+        };
         for marker in &data.preview.markers {
             let projected = camera.project(marker.position);
-            let color = Color32::from_rgb(30, 112, 165);
-            painter.circle_filled(projected.pos, 4.0, color);
-            painter.text(
-                projected.pos + Vec2::new(6.0, -6.0),
-                Align2::LEFT_BOTTOM,
-                &marker.name,
-                FontId::proportional(10.0),
-                color,
-            );
+            let marker_color = Color32::BLACK;
+            painter.circle_filled(projected.pos, 4.0, marker_color);
+            if hover_pos.is_some_and(|pos| screen_edge_length(pos, projected.pos) <= 8.0) {
+                let text_pos = projected.pos + Vec2::new(7.0, -7.0);
+                let label_rect = egui::Rect::from_min_size(
+                    text_pos,
+                    Vec2::new(marker.name.len() as f32 * 6.0 + 8.0, 16.0),
+                );
+                painter.rect_filled(
+                    label_rect,
+                    2.0,
+                    Color32::from_rgba_unmultiplied(0, 0, 0, 180),
+                );
+                painter.text(
+                    text_pos + Vec2::new(4.0, 1.0),
+                    Align2::LEFT_TOP,
+                    &marker.name,
+                    FontId::proportional(10.0),
+                    Color32::from_rgb(255, 230, 40),
+                );
+            }
         }
     }
 }
@@ -420,7 +584,11 @@ fn collect_visible_triangles_into(
         out.push(ModelProjectedTriangle {
             points: [pa.pos, pb.pos, pc.pos],
             depth: (pa.depth + pb.depth + pc.depth) / 3.0,
-            fill: triangle.fill,
+            fills: [
+                shade_model_color(triangle.fill, camera.rotate_vector(triangle.normals[0])),
+                shade_model_color(triangle.fill, camera.rotate_vector(triangle.normals[1])),
+                shade_model_color(triangle.fill, camera.rotate_vector(triangle.normals[2])),
+            ],
         });
     }
 }
@@ -491,34 +659,29 @@ fn build_model_source_triangles(
             .min(preview.indices.len());
         let fill = material_color(batch.material_index);
         for chunk in preview.indices[start..end].chunks_exact(3) {
-            let Some(a) = preview
-                .vertices
-                .get(chunk[0] as usize)
-                .map(|vertex| vertex.position)
-            else {
+            let Some(a) = preview.vertices.get(chunk[0] as usize) else {
                 continue;
             };
-            let Some(b) = preview
-                .vertices
-                .get(chunk[1] as usize)
-                .map(|vertex| vertex.position)
-            else {
+            let Some(b) = preview.vertices.get(chunk[1] as usize) else {
                 continue;
             };
-            let Some(c) = preview
-                .vertices
-                .get(chunk[2] as usize)
-                .map(|vertex| vertex.position)
-            else {
+            let Some(c) = preview.vertices.get(chunk[2] as usize) else {
                 continue;
             };
-            let max_edge = triangle_max_edge(a, b, c);
+            let [pa, pb, pc] = [a.position, b.position, c.position];
+            let max_edge = triangle_max_edge(pa, pb, pc);
             if max_edge > max_preview_edge {
                 continue;
             }
+            let face_normal = triangle_normal(pa, pb, pc);
             out.push(ModelSourceTriangle {
                 batch_index,
-                positions: [a, b, c],
+                positions: [pa, pb, pc],
+                normals: [
+                    usable_normal_or(a.normal, face_normal),
+                    usable_normal_or(b.normal, face_normal),
+                    usable_normal_or(c.normal, face_normal),
+                ],
                 fill,
             });
         }
@@ -538,6 +701,70 @@ fn material_color(index: u16) -> Color32 {
     ];
     let (r, g, b) = COLORS[index as usize % COLORS.len()];
     Color32::from_rgb(r, g, b)
+}
+
+fn shade_model_color(base: Color32, normal_view: [f32; 3]) -> Color32 {
+    let normal = normalize3(normal_view);
+    let key = dot3(normal, normalize3([-0.35, -0.55, 0.76])).max(0.0);
+    let fill = dot3(normal, normalize3([0.72, 0.22, 0.36])).max(0.0);
+    let rim = (1.0 - normal[1].abs()).clamp(0.0, 1.0).powi(2);
+    let overhead = (normal[2] * 0.5 + 0.5).clamp(0.0, 1.0);
+    let shade = (0.42 + key * 0.46 + fill * 0.16 + rim * 0.10 + overhead * 0.08).clamp(0.32, 1.22);
+    let highlight = (key * key * 22.0).clamp(0.0, 24.0);
+    Color32::from_rgb(
+        shade_channel(base.r(), shade, highlight),
+        shade_channel(base.g(), shade, highlight),
+        shade_channel(base.b(), shade, highlight),
+    )
+}
+
+fn shade_channel(value: u8, shade: f32, highlight: f32) -> u8 {
+    ((value as f32 * shade + highlight).round()).clamp(0.0, 255.0) as u8
+}
+
+fn usable_normal_or(normal: [f32; 3], fallback: [f32; 3]) -> [f32; 3] {
+    if length_squared3(normal) <= 0.0001 {
+        return fallback;
+    }
+    let normalized = normalize3(normal);
+    if length_squared3(normalized) > 0.25 {
+        normalized
+    } else {
+        fallback
+    }
+}
+
+fn triangle_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
+    normalize3(cross3(sub3(b, a), sub3(c, a)))
+}
+
+fn normalize3(v: [f32; 3]) -> [f32; 3] {
+    let len = length_squared3(v).sqrt();
+    if len <= f32::EPSILON {
+        [0.0, 0.0, 1.0]
+    } else {
+        [v[0] / len, v[1] / len, v[2] / len]
+    }
+}
+
+fn length_squared3(v: [f32; 3]) -> f32 {
+    dot3(v, v)
+}
+
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
 }
 
 struct ProjectedPoint {
@@ -587,6 +814,22 @@ impl PreviewCamera {
         let mut x = (point[0] - self.center[0]) * self.scale;
         let mut y = (point[1] - self.center[1]) * self.scale;
         let mut z = (point[2] - self.center[2]) * self.scale;
+        let rotated = self.rotate_vector([x, y, z]);
+        x = rotated[0];
+        y = rotated[1];
+        z = rotated[2];
+        let fit = self.rect.width().min(self.rect.height()) / (self.radius * 2.2).max(0.001);
+        let screen = self.rect.center() + self.pan + Vec2::new(x * fit, -z * fit);
+        ProjectedPoint {
+            pos: screen,
+            depth: y,
+        }
+    }
+
+    fn rotate_vector(&self, vector: [f32; 3]) -> [f32; 3] {
+        let mut x = vector[0];
+        let mut y = vector[1];
+        let mut z = vector[2];
         let (sy, cy) = self.yaw.sin_cos();
         let yaw_x = x * cy - y * sy;
         let yaw_y = x * sy + y * cy;
@@ -597,12 +840,7 @@ impl PreviewCamera {
         let pitch_z = y * sp + z * cp;
         y = pitch_y;
         z = pitch_z;
-        let fit = self.rect.width().min(self.rect.height()) / (self.radius * 2.2).max(0.001);
-        let screen = self.rect.center() + self.pan + Vec2::new(x * fit, -z * fit);
-        ProjectedPoint {
-            pos: screen,
-            depth: y,
-        }
+        [x, y, z]
     }
 
     fn screen_radius(&self) -> f32 {

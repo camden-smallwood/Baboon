@@ -126,13 +126,14 @@ impl FilterCache {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq)]
 pub(super) struct GuiPrefs {
     pub(super) browser_mode: BrowserMode,
     pub(super) show_browser_prefixes: bool,
     pub(super) double_click_to_open_tags: bool,
     pub(super) expert_mode: bool,
     pub(super) dark_mode: bool,
+    pub(super) model_preview_size: f32,
     pub(super) blender_path: Option<PathBuf>,
 }
 
@@ -255,6 +256,27 @@ pub(super) struct ShaderParamOp {
     pub(super) real_value: f32,
 }
 
+#[derive(Clone)]
+pub(super) enum ModelVariantOp {
+    Create {
+        name: String,
+        regions: Vec<ModelVariantRegionChoice>,
+    },
+    Update {
+        variant_index: usize,
+        regions: Vec<ModelVariantRegionChoice>,
+    },
+    Drop {
+        variant_index: usize,
+    },
+}
+
+#[derive(Clone)]
+pub(super) struct ModelVariantRegionChoice {
+    pub(super) region_name: String,
+    pub(super) permutation_name: String,
+}
+
 /// What the user clicked in a block header this frame.
 #[derive(Default)]
 pub(super) struct BlockHeaderActions {
@@ -297,6 +319,8 @@ pub(super) struct FieldEditContext<'a> {
     pub(super) shader_ops: &'a mut Vec<ShaderOp>,
     /// Shader-specific deferred ops (create parameter entry + set real value).
     pub(super) shader_param_ops: &'a mut Vec<ShaderParamOp>,
+    /// Model-preview variant edits queued from the render model tab.
+    pub(super) model_variant_ops: &'a mut Vec<ModelVariantOp>,
     /// Set when the user clicks a color swatch on a value row; the caller hoists
     /// it into `self.color_popup` after rendering so the shared popup handler
     /// can show the picker and apply the edit.
@@ -369,10 +393,15 @@ impl Default for GuiPrefs {
             double_click_to_open_tags: false,
             expert_mode: false,
             dark_mode: false,
+            model_preview_size: DEFAULT_MODEL_PREVIEW_SIZE,
             blender_path: None,
         }
     }
 }
+
+pub(super) const DEFAULT_MODEL_PREVIEW_SIZE: f32 = 1.0;
+pub(super) const MIN_MODEL_PREVIEW_SIZE: f32 = 0.8;
+pub(super) const MAX_MODEL_PREVIEW_SIZE: f32 = 2.6;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum BitmapPanelTab {
@@ -434,6 +463,8 @@ pub(super) struct ModelPreviewState {
     pub(super) loaded_key: Option<String>,
     pub(super) render_model_path: Option<String>,
     pub(super) data: Option<Result<ModelPreviewData, String>>,
+    pub(super) active_tab: ModelTagPanelTab,
+    pub(super) new_variant_name: String,
     pub(super) selected_variant: Option<usize>,
     pub(super) region_selections: HashMap<String, ModelRegionSelection>,
     pub(super) projected_triangles: Vec<ModelProjectedTriangle>,
@@ -452,6 +483,8 @@ impl Default for ModelPreviewState {
             loaded_key: None,
             render_model_path: None,
             data: None,
+            active_tab: ModelTagPanelTab::Fields,
+            new_variant_name: String::new(),
             selected_variant: None,
             region_selections: HashMap::new(),
             projected_triangles: Vec::new(),
@@ -464,6 +497,12 @@ impl Default for ModelPreviewState {
             pan: Vec2::ZERO,
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ModelTagPanelTab {
+    Fields,
+    RenderModel,
 }
 
 #[derive(Clone)]
@@ -491,11 +530,12 @@ pub(super) struct ModelVariantPreview {
 pub(super) struct ModelSourceTriangle {
     pub(super) batch_index: usize,
     pub(super) positions: [[f32; 3]; 3],
+    pub(super) normals: [[f32; 3]; 3],
     pub(super) fill: Color32,
 }
 
 pub(super) struct ModelProjectedTriangle {
     pub(super) points: [egui::Pos2; 3],
     pub(super) depth: f32,
-    pub(super) fill: Color32,
+    pub(super) fills: [Color32; 3],
 }

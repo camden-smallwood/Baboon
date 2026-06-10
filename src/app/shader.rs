@@ -1828,6 +1828,7 @@ pub(super) fn draw_shader_grid_row_readonly(
     let mut block_ops = Vec::new();
     let mut shader_ops = Vec::new();
     let mut shader_param_ops = Vec::new();
+    let mut model_variant_ops = Vec::new();
     let mut block_confirm = None;
     let mut open_request = None;
     let mut tool_import = None;
@@ -1850,6 +1851,7 @@ pub(super) fn draw_shader_grid_row_readonly(
         bitmap_reimport: &mut bitmap_reimport,
         shader_ops: &mut shader_ops,
         shader_param_ops: &mut shader_param_ops,
+        model_variant_ops: &mut model_variant_ops,
         color_request: &mut color_request,
         block_clipboard: None,
         block_clip_request: &mut block_clip_request,

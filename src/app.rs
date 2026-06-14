@@ -16,9 +16,10 @@ use blam_tags::render_method::{
 };
 use blam_tags::{
     AssFile, Bitmap, ColorGraphType, Endian, FunctionFlags, FunctionType, JmsFile, RenderModel,
-    RenderModelPreview, StringIdData, TagBlock, TagField, TagFieldData, TagFieldType, TagFile,
-    TagFunction, TagReferenceData, TagResource, TagResourceKind, TagStruct, format_group_tag,
-    parse_group_tag,
+    RenderModelPreview, RenderModelPreviewBatch, RenderModelPreviewMarker,
+    RenderModelPreviewRegion, RenderModelPreviewVertex, StringIdData, TagBlock, TagField,
+    TagFieldData, TagFieldType, TagFile, TagFunction, TagReferenceData, TagResource,
+    TagResourceKind, TagStruct, format_group_tag, parse_group_tag,
 };
 use eframe::egui::{
     self, Align2, Color32, FontData, FontDefinitions, FontFamily, FontId, Frame, RichText,

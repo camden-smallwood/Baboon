@@ -24,6 +24,8 @@ pub(super) fn export_loose_folder_json(
     }
     let source = TagSource::LooseFolder {
         root: root.to_path_buf(),
+        game: None,
+        definitions_root: PathBuf::new(),
     };
     export_tag_json_entries(&source, &entries, output)
 }
@@ -177,11 +179,11 @@ pub(super) fn extract_geometry_for_entry(
             ass.write(&mut file)?;
             Ok(format!("Extracted BSP geometry {}", path.display()))
         }
-        b"mode" => {
+        b"mode" | b"mod2" => {
             let tag = read_entry(source, entry)?;
             fs::create_dir_all(output)?;
             let stem = tag_file_stem(entry);
-            let jms = JmsFile::from_render_model(&tag)?;
+            let jms = render_jms_for_game(&tag)?;
             let path = output.join(format!("{stem}.render.jms"));
             let mut file = fs::File::create(&path)?;
             jms.write(&mut file, blam_tags::game::Game::of(&tag).jms_version())?;
@@ -587,7 +589,7 @@ pub(super) fn extract_model_geometry(
     };
 
     let render_jms_for_skeleton = match render_tag.as_ref() {
-        Some(tag) => match JmsFile::from_render_model(tag) {
+        Some(tag) => match render_jms_for_game(tag) {
             Ok(jms) => Some(jms),
             Err(error) => {
                 skipped.push(format!("render skeleton: {error}"));
@@ -607,7 +609,8 @@ pub(super) fn extract_model_geometry(
     if let Some(tag) = render_tag.as_ref() {
         let render_dir = output.join("render");
         fs::create_dir_all(&render_dir)?;
-        if render_model_prefers_ass(tag) {
+        let game = blam_tags::game::Game::of(tag);
+        if matches!(game, blam_tags::game::Game::Halo3) && render_model_prefers_ass(tag) {
             let ass = AssFile::from_render_model(tag)?;
             let path = render_dir.join(format!("{stem}.render.ASS"));
             let mut file = fs::File::create(&path)?;
@@ -690,9 +693,16 @@ pub(super) fn load_referenced_tag_from_source(
 ) -> anyhow::Result<TagFile> {
     let group_tag = u32::from_be_bytes(*group_tag);
     match source {
-        TagSource::LooseFolder { root } => {
+        TagSource::LooseFolder { root, .. } => {
             let path = resolve_tag_path(root, reference, extension);
-            TagFile::read(&path)
+            let entry = TagEntry {
+                key: format!("file:{}", path.display()),
+                display_path: format!("{}.{}", reference.replace('\\', "/"), extension),
+                group_tag,
+                group_name: Some(extension.to_owned()),
+                location: TagEntryLocation::LooseFile(path.clone()),
+            };
+            read_entry(source, &entry)
                 .map_err(|error| anyhow::anyhow!("read {} failed: {error}", path.display()))
         }
         TagSource::SingleFile { path } => {
@@ -709,6 +719,14 @@ pub(super) fn load_referenced_tag_from_source(
             .read_tag_by_name(group_tag, reference)
             .map_err(|error| anyhow::anyhow!("read {reference}.{extension} failed: {error}")),
     }
+}
+
+pub(super) fn render_jms_for_game(tag: &TagFile) -> anyhow::Result<JmsFile> {
+    Ok(match blam_tags::game::Game::of(tag) {
+        blam_tags::game::Game::Halo1 => JmsFile::from_gbxmodel(tag)?,
+        blam_tags::game::Game::Halo2 => JmsFile::from_h2_render_model(tag)?,
+        blam_tags::game::Game::Halo3 => JmsFile::from_render_model(tag)?,
+    })
 }
 
 pub(super) fn render_model_prefers_ass(tag: &TagFile) -> bool {
@@ -740,15 +758,33 @@ pub(super) fn run_shell_extraction(
 ) -> anyhow::Result<String> {
     let shell = shell_binary_path()?;
     let mut command = Command::new(&shell);
-    if let TagSource::MonolithicCache { root, .. } = source {
-        command.arg("--cache").arg(root);
+    if let Some(definitions_parent) = locate_definitions_root().parent() {
+        command.current_dir(definitions_parent);
+    }
+    match source {
+        TagSource::MonolithicCache { root, .. } => {
+            command.arg("--cache").arg(root);
+        }
+        TagSource::LooseFolder {
+            game: Some(game), ..
+        } => {
+            command.arg("--game").arg(game);
+        }
+        _ => {}
     }
     command.arg(command_name);
     command.arg(shell_entry_arg(entry)?);
     if command_name == "extract-geometry" && entry.group_tag == u32::from_be_bytes(*b"hlmt") {
         command.arg("all");
     }
-    command.arg("--output").arg(output);
+    let output_arg = if output.is_absolute() {
+        output.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(output))
+            .unwrap_or_else(|_| output.to_path_buf())
+    };
+    command.arg("--output").arg(output_arg);
     let output_data = command.output()?;
     if !output_data.status.success() {
         let stderr = String::from_utf8_lossy(&output_data.stderr);

@@ -638,7 +638,8 @@ pub(super) fn apply_one_shader_op(tag: &mut TagFile, op: &ShaderOp) -> Result<St
 }
 
 pub(super) fn is_editable_tag(entry: &TagEntry, tag: &TagFile) -> bool {
-    tag.endian == Endian::Le && matches!(entry.location, TagEntryLocation::LooseFile(_))
+    matches!(entry.location, TagEntryLocation::LooseFile(_))
+        && (tag.classic_engine().is_some() || tag.endian == Endian::Le)
 }
 
 pub(super) fn append_field_path(prefix: &str, field_name: &str) -> String {

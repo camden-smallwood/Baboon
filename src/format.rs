@@ -76,6 +76,8 @@ impl TagNameIndex {
             include_str!("../blam-tags/definitions/haloreach_mcc/_meta.json"),
             include_str!("../blam-tags/definitions/halo4_mcc/_meta.json"),
             include_str!("../blam-tags/definitions/halo2amp_mcc/_meta.json"),
+            include_str!("../blam-tags/definitions/halo2_mcc/_meta.json"),
+            include_str!("../blam-tags/definitions/haloce_mcc/_meta.json"),
         ];
         let mut index = TagNameIndex::default();
         for json in EMBEDDED {

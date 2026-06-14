@@ -26,6 +26,7 @@ pub(super) fn draw_material_tag(
             if is_shader_tag(entry) {
                 if let Some(model) =
                     build_shader_editor_model(tag, entry.group_tag, source, rmdf_cache, rmop_cache)
+                        .or_else(|| build_classic_shader_editor_model(tag, names))
                 {
                     draw_shader_editor_model(ui, &model, color_popup, function_popup, edit);
                     return;

@@ -1002,7 +1002,7 @@ impl eframe::App for Baboon {
                             .auto_shrink([false, false])
                             .show(ui, |ui| match mode {
                                 BrowserMode::Folders => {
-                                    if let TagSource::LooseFolder { root } = &source.source {
+                                    if let TagSource::LooseFolder { root, .. } = &source.source {
                                         let root = root.clone();
                                         draw_tree_lazy(
                                             ui,
@@ -1288,7 +1288,7 @@ impl eframe::App for Baboon {
                             group_tag: entry.group_tag,
                             tags_root: self.source.as_ref().and_then(|source| {
                                 match &source.source {
-                                    TagSource::LooseFolder { root } => Some(root.as_path()),
+                                    TagSource::LooseFolder { root, .. } => Some(root.as_path()),
                                     _ => None,
                                 }
                             }),

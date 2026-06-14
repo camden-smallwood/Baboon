@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use blam_tags::classic::{ClassicHeader, read_classic_tag_file};
 use blam_tags::monolithic::MonolithicCache;
 use blam_tags::paths::group_tag_to_extension;
-use blam_tags::{TagFile, format_group_tag};
+use blam_tags::{TagFile, TagLayout, format_group_tag};
 use serde_json;
 use walkdir::WalkDir;
 
@@ -35,6 +36,8 @@ pub enum TagSource {
     },
     LooseFolder {
         root: PathBuf,
+        game: Option<String>,
+        definitions_root: PathBuf,
     },
     MonolithicCache {
         root: PathBuf,
@@ -46,7 +49,7 @@ impl TagSource {
     pub fn origin_label(&self) -> String {
         match self {
             TagSource::SingleFile { path } => format!("File: {}", path.display()),
-            TagSource::LooseFolder { root } => format!("Folder: {}", root.display()),
+            TagSource::LooseFolder { root, .. } => format!("Folder: {}", root.display()),
             TagSource::MonolithicCache { root, .. } => {
                 format!("Monolithic cache: {}", root.display())
             }
@@ -170,7 +173,8 @@ struct TreeBuildNode {
 }
 
 pub fn load_single_file(path: PathBuf, names: &TagNameIndex) -> Result<LoadedSourceData> {
-    let tag = TagFile::read(&path).with_context(|| format!("failed to load {}", path.display()))?;
+    let tag = read_non_classic_tag(&path)
+        .with_context(|| format!("failed to load {}", path.display()))?;
     let group_tag = tag.group().tag;
     let group_name = names.name_for(group_tag).map(str::to_owned);
     let file_name = path
@@ -228,6 +232,8 @@ pub fn load_folder(
         label: info.label,
         source: TagSource::LooseFolder {
             root: info.scan_root,
+            game: game.clone(),
+            definitions_root: definitions_root.to_path_buf(),
         },
         names,
         game,
@@ -295,8 +301,17 @@ pub fn load_monolithic_blob_index(
 
 pub fn read_entry(source: &TagSource, entry: &TagEntry) -> Result<TagFile> {
     match (&entry.location, source) {
+        (
+            TagEntryLocation::LooseFile(path),
+            TagSource::LooseFolder {
+                game,
+                definitions_root,
+                ..
+            },
+        ) => read_loose_tag(path, entry, game.as_deref(), definitions_root)
+            .with_context(|| format!("failed to load {}", path.display())),
         (TagEntryLocation::LooseFile(path), _) => {
-            TagFile::read(path).with_context(|| format!("failed to load {}", path.display()))
+            read_non_classic_tag(path).with_context(|| format!("failed to load {}", path.display()))
         }
         (
             TagEntryLocation::Monolithic { name, group_tag },
@@ -311,6 +326,47 @@ pub fn read_entry(source: &TagSource, entry: &TagEntry) -> Result<TagFile> {
             anyhow::bail!("monolithic entry selected outside a monolithic source")
         }
     }
+}
+
+fn read_loose_tag(
+    path: &Path,
+    entry: &TagEntry,
+    game: Option<&str>,
+    definitions_root: &Path,
+) -> Result<TagFile> {
+    let bytes = std::fs::read(path)?;
+    if ClassicHeader::parse(&bytes).is_some() {
+        let game = game.context(
+            "classic Halo CE / Halo 2 tags require a detected game profile to locate definitions",
+        )?;
+        let group_name = entry.group_name.as_deref().with_context(|| {
+            format!(
+                "no group definition for {} in definitions/{game}/",
+                format_group_tag(entry.group_tag)
+            )
+        })?;
+        let def_path = definitions_root
+            .join(game)
+            .join(format!("{group_name}.json"));
+        let layout = TagLayout::from_json(&def_path)
+            .with_context(|| format!("failed to load classic layout {}", def_path.display()))?;
+        return read_classic_tag_file(&bytes, layout)
+            .map_err(|error| anyhow::anyhow!("failed to decode classic tag: {error}"));
+    }
+    TagFile::read(path).map_err(Into::into)
+}
+
+fn read_non_classic_tag(path: &Path) -> Result<TagFile> {
+    let mut header = [0u8; 64];
+    if let Ok(mut file) = File::open(path) {
+        let read = file.read(&mut header)?;
+        if read >= 64 && ClassicHeader::parse(&header).is_some() {
+            anyhow::bail!(
+                "classic Halo CE / Halo 2 tags require opening an editing-kit tags folder so Baboon can detect the game profile"
+            );
+        }
+    }
+    TagFile::read(path).map_err(Into::into)
 }
 
 pub fn normalize_blob_index_path(path: &Path) -> Result<PathBuf> {
@@ -811,6 +867,8 @@ fn detect_ek_root(path: &Path) -> Option<(PathBuf, &'static str)> {
 
 fn ek_folder_game(name: &str) -> Option<&'static str> {
     match name.to_ascii_uppercase().as_str() {
+        "HCEEK" | "H1EK" | "HALOCEEK" | "HALOCE_MCC" => Some("haloce_mcc"),
+        "H2EK" | "HALO2EK" | "HALO2_MCC" => Some("halo2_mcc"),
         "HREK" => Some("haloreach_mcc"),
         "H4EK" => Some("halo4_mcc"),
         "H3ODSTEK" => Some("halo3odst_mcc"),
@@ -949,6 +1007,9 @@ fn probe_tag_group(path: &Path) -> Result<Option<u32>> {
     let mut header = [0u8; 64];
     file.seek(SeekFrom::Start(0))?;
     file.read_exact(&mut header)?;
+    if let Some((classic, _)) = ClassicHeader::parse(&header) {
+        return Ok(Some(u32::from_be_bytes(classic.group_tag)));
+    }
     match &header[60..64] {
         b"MALB" => Ok(Some(u32::from_le_bytes([
             header[48], header[49], header[50], header[51],
@@ -1105,6 +1166,42 @@ mod tests {
     }
 
     #[test]
+    fn probes_classic_h2_group_from_reversed_header() {
+        let root = temp_dir("classic_h2_probe");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("brute.mode");
+        let mut bytes = [0u8; 64];
+        bytes[36..40].copy_from_slice(b"edom");
+        bytes[60..64].copy_from_slice(b"!MLB");
+        fs::write(&path, bytes).unwrap();
+
+        assert_eq!(
+            probe_tag_group(&path).unwrap(),
+            Some(u32::from_be_bytes(*b"mode"))
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn probes_classic_ce_group_from_big_endian_header() {
+        let root = temp_dir("classic_ce_probe");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("cyborg.gbxmodel");
+        let mut bytes = [0u8; 64];
+        bytes[36..40].copy_from_slice(b"mod2");
+        bytes[60..64].copy_from_slice(b"blam");
+        fs::write(&path, bytes).unwrap();
+
+        assert_eq!(
+            probe_tag_group(&path).unwrap(),
+            Some(u32::from_be_bytes(*b"mod2"))
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn load_folder_descends_into_ek_tags_root() {
         let root = temp_dir("h4ek");
         let ek_root = root.join("H4EK");
@@ -1135,7 +1232,7 @@ mod tests {
         assert!(!loaded.tree.children[0].children_loaded);
         assert!(!loaded.tree.children[0].entries_loaded);
         match loaded.source {
-            TagSource::LooseFolder { root } => assert!(root.ends_with("tags")),
+            TagSource::LooseFolder { root, .. } => assert!(root.ends_with("tags")),
             _ => panic!("expected loose folder source"),
         }
     }
@@ -1205,6 +1302,15 @@ mod tests {
 
     #[test]
     fn detects_supported_ek_games_from_root_or_tags_folder() {
+        assert_eq!(detect_ek_game(&PathBuf::from("HCEEK")), Some("haloce_mcc"));
+        assert_eq!(
+            detect_ek_game(&PathBuf::from("H1EK").join("tags")),
+            Some("haloce_mcc")
+        );
+        assert_eq!(
+            detect_ek_game(&PathBuf::from("H2EK").join("tags")),
+            Some("halo2_mcc")
+        );
         assert_eq!(
             detect_ek_game(&PathBuf::from("HREK")),
             Some("haloreach_mcc")

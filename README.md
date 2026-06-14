@@ -24,6 +24,8 @@ kits, detected from the kit's root folder name:
 
 | Editing kit | Folder | Game identifier |
 |-------------|--------|-----------------|
+| Halo CE | `HCEEK` / `H1EK` | `haloce_mcc` |
+| Halo 2 | `H2EK` | `halo2_mcc` |
 | Halo 3 | `H3EK` | `halo3_mcc` |
 | Halo 3: ODST | `H3ODSTEK` | `halo3odst_mcc` |
 | Halo: Reach | `HREK` | `haloreach_mcc` |
@@ -175,9 +177,10 @@ Toolbar buttons launch the loaded kit's tools, with the executable auto-detected
 per game:
 
 - **Sapien** (`sapien.exe`).
-- **tag_test** — the game-specific build (`halo3_tag_test.exe`,
-  `atlas_tag_test.exe`, `reach_tag_test.exe`, `halo4_tag_test.exe`, or the
-  generic `tag_test.exe`).
+- **tag_test** — the game-specific build (`halo_tag_test.exe`,
+  `halo2_tag_test.exe`, `halo3_tag_test.exe`, `atlas_tag_test.exe`,
+  `reach_tag_test.exe`, `halo4_tag_test.exe`, or the generic
+  `tag_test.exe`).
 - **Blender** — at a user-configured path (set in *File → Settings*).
 
 Launchers are disabled until the relevant executable is found in the kit.

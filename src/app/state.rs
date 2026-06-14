@@ -614,6 +614,7 @@ pub(super) struct ModelPreviewData {
 pub(super) struct ModelVariantPreview {
     pub(super) name: String,
     pub(super) regions: HashMap<String, String>,
+    pub(super) has_explicit_regions: bool,
 }
 
 #[derive(Clone, Copy)]

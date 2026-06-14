@@ -138,11 +138,18 @@ fn ensure_model_preview_loaded(
         return;
     }
     state.loaded_key = Some(entry.key.clone());
-    state.data = Some(load_model_preview(model_tag, names, source).map(|data| {
-        state.render_model_path = Some(data.render_model_path.clone());
-        reset_model_preview_selection(state, &data, None);
-        data
-    }));
+    state.data = Some(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            load_model_preview(model_tag, names, source)
+        }))
+        .map_err(|_| "Render model preview crashed while parsing this tag.".to_owned())
+        .and_then(|result| result)
+        .map(|data| {
+            state.render_model_path = Some(data.render_model_path.clone());
+            reset_model_preview_selection(state, &data, None);
+            data
+        }),
+    );
 }
 
 fn load_model_preview(
@@ -157,7 +164,7 @@ fn load_model_preview(
     if rel_path.trim().is_empty() {
         return Err("This model tag has an empty render model reference.".to_owned());
     }
-    let Some(TagSource::LooseFolder { root }) = source else {
+    let Some(TagSource::LooseFolder { root, .. }) = source else {
         return Err("Render model preview requires a loaded loose-folder editing kit.".to_owned());
     };
     let extension = names
@@ -184,8 +191,14 @@ fn load_model_preview(
     };
     let render_tag =
         read_entry(source.unwrap(), &render_entry).map_err(|error| error.to_string())?;
-    let render_model = RenderModel::from_tag(&render_tag).map_err(|error| error.to_string())?;
-    let preview = render_model.to_preview();
+    let preview = if render_tag.classic_engine().is_some() {
+        let jms = render_jms_for_game(&render_tag).map_err(|error| error.to_string())?;
+        let region_perms = read_render_region_permutations(&render_tag);
+        preview_from_jms(&jms, &region_perms)
+    } else {
+        let render_model = RenderModel::from_tag(&render_tag).map_err(|error| error.to_string())?;
+        render_model.to_preview()
+    };
     if preview.batches.is_empty() {
         return Err("Referenced render_model has no previewable draw batches.".to_owned());
     }
@@ -200,6 +213,192 @@ fn load_model_preview(
     })
 }
 
+fn preview_from_jms(
+    jms: &JmsFile,
+    render_region_perms: &[(String, Vec<String>)],
+) -> RenderModelPreview {
+    let mut preview = RenderModelPreview {
+        regions: if !render_region_perms.is_empty() {
+            render_region_perms
+                .iter()
+                .map(|(name, permutations)| RenderModelPreviewRegion {
+                    name: name.clone(),
+                    permutations: if permutations.is_empty() {
+                        vec!["default".to_owned()]
+                    } else {
+                        permutations.clone()
+                    },
+                })
+                .collect()
+        } else if jms.regions.is_empty() {
+            vec![RenderModelPreviewRegion {
+                name: "default".to_owned(),
+                permutations: vec!["default".to_owned()],
+            }]
+        } else {
+            jms.regions
+                .iter()
+                .map(|name| RenderModelPreviewRegion {
+                    name: name.clone(),
+                    permutations: vec!["default".to_owned()],
+                })
+                .collect()
+        },
+        bounds_min: [f32::INFINITY; 3],
+        bounds_max: [f32::NEG_INFINITY; 3],
+        ..Default::default()
+    };
+
+    let region_names = preview
+        .regions
+        .iter()
+        .map(|region| region.name.clone())
+        .collect::<Vec<_>>();
+    for triangle in &jms.triangles {
+        let index_start = preview.indices.len() as u32;
+        for vertex_index in triangle.v {
+            let Some(vertex) = jms.vertices.get(vertex_index as usize) else {
+                continue;
+            };
+            let position = [vertex.position.x, vertex.position.y, vertex.position.z];
+            let normal = [vertex.normal.i, vertex.normal.j, vertex.normal.k];
+            expand_preview_bounds_local(&mut preview.bounds_min, &mut preview.bounds_max, position);
+            let new_index = preview.vertices.len() as u32;
+            preview
+                .vertices
+                .push(RenderModelPreviewVertex { position, normal });
+            preview.indices.push(new_index);
+        }
+        if preview.indices.len() as u32 == index_start + 3 {
+            let (region_name, permutation_name) = infer_jms_triangle_region_permutation(
+                jms,
+                triangle.material,
+                triangle.region,
+                &region_names,
+            );
+            preview.batches.push(RenderModelPreviewBatch {
+                region_name,
+                permutation_name,
+                material_index: triangle.material.max(0) as u16,
+                part_type: 0,
+                index_start,
+                index_count: 3,
+            });
+        }
+    }
+
+    if !preview.bounds_min[0].is_finite() {
+        preview.bounds_min = [0.0; 3];
+        preview.bounds_max = [0.0; 3];
+    }
+
+    preview.markers = jms
+        .markers
+        .iter()
+        .map(|marker| RenderModelPreviewMarker {
+            name: marker.name.clone(),
+            position: [
+                marker.translation.x,
+                marker.translation.y,
+                marker.translation.z,
+            ],
+            axes: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        })
+        .collect();
+    preview
+}
+
+fn read_render_region_permutations(tag: &TagFile) -> Vec<(String, Vec<String>)> {
+    let Some(regions) = tag
+        .root()
+        .field("regions")
+        .and_then(|field| field.as_block())
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for region_index in 0..regions.len() {
+        let Some(region) = regions.element(region_index) else {
+            continue;
+        };
+        let name = read_stringish_field(&region, "name")
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| format!("region {region_index}"));
+        let mut permutations = Vec::new();
+        if let Some(perms) = region
+            .field("permutations")
+            .and_then(|field| field.as_block())
+        {
+            for perm_index in 0..perms.len() {
+                let Some(perm) = perms.element(perm_index) else {
+                    continue;
+                };
+                let perm_name = read_stringish_field(&perm, "name")
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| format!("permutation {perm_index}"));
+                if !permutations.iter().any(|existing| existing == &perm_name) {
+                    permutations.push(perm_name);
+                }
+            }
+        }
+        out.push((name, permutations));
+    }
+    out
+}
+
+fn infer_jms_triangle_region_permutation(
+    jms: &JmsFile,
+    material_index: i32,
+    region_index: i32,
+    region_names: &[String],
+) -> (String, String) {
+    if let Some(region_name) = jms.regions.get(region_index.max(0) as usize) {
+        return (region_name.clone(), "default".to_owned());
+    }
+    let label = material_index
+        .checked_abs()
+        .and_then(|index| jms.materials.get(index as usize))
+        .map(|material| strip_jms_slot_prefix(&material.material_name))
+        .unwrap_or_default();
+    let mut regions = region_names.iter().collect::<Vec<_>>();
+    regions.sort_by_key(|name| std::cmp::Reverse(name.len()));
+    for region in regions {
+        if label == *region {
+            return (region.clone(), "default".to_owned());
+        }
+        let suffix = format!(" {region}");
+        if let Some(perm) = label.strip_suffix(&suffix) {
+            let perm = perm.trim();
+            if !perm.is_empty() {
+                return (region.clone(), perm.to_owned());
+            }
+        }
+    }
+    ("default".to_owned(), "default".to_owned())
+}
+
+fn strip_jms_slot_prefix(label: &str) -> String {
+    label
+        .split_once(')')
+        .map(|(_, rest)| rest.trim().to_owned())
+        .unwrap_or_else(|| label.trim().to_owned())
+}
+
+fn read_stringish_field(tag_struct: &TagStruct<'_>, name: &str) -> Option<String> {
+    match tag_struct.field(name)?.value()? {
+        TagFieldData::String(value) | TagFieldData::LongString(value) => Some(value),
+        TagFieldData::StringId(id) | TagFieldData::OldStringId(id) => Some(id.string),
+        _ => None,
+    }
+}
+
+fn expand_preview_bounds_local(min: &mut [f32; 3], max: &mut [f32; 3], point: [f32; 3]) {
+    for axis in 0..3 {
+        min[axis] = min[axis].min(point[axis]);
+        max[axis] = max[axis].max(point[axis]);
+    }
+}
+
 fn read_model_variants(tag: &TagFile) -> Vec<ModelVariantPreview> {
     let Some(variants) = tag.root().field_path("variants").and_then(|f| f.as_block()) else {
         return Vec::new();
@@ -210,44 +409,63 @@ fn read_model_variants(tag: &TagFile) -> Vec<ModelVariantPreview> {
             continue;
         };
         let name =
-            read_named_string(&variant, "name").unwrap_or_else(|| format!("variant {index}"));
+            read_named_string_exact(&variant, "name").unwrap_or_else(|| format!("variant {index}"));
         let mut regions = HashMap::new();
+        let mut has_explicit_regions = false;
         if let Some(region_block) = variant.field("regions").and_then(|f| f.as_block()) {
             for region_index in 0..region_block.len() {
                 let Some(region) = region_block.element(region_index) else {
                     continue;
                 };
-                let Some(region_name) = read_named_string(&region, "region name") else {
+                let Some(region_name) = read_named_string_exact(&region, "region name") else {
                     continue;
                 };
+                has_explicit_regions = true;
                 let permutation = region
                     .field("permutations")
                     .and_then(|f| f.as_block())
                     .and_then(|perms| perms.element(0))
-                    .and_then(|perm| read_named_string(&perm, "permutation name"));
+                    .and_then(|perm| read_named_string_exact(&perm, "permutation name"));
                 if let Some(permutation) = permutation {
                     regions.insert(region_name, permutation);
                 }
             }
         }
-        out.push(ModelVariantPreview { name, regions });
+        out.push(ModelVariantPreview {
+            name,
+            regions,
+            has_explicit_regions,
+        });
     }
     out
 }
 
-fn read_named_string(tag_struct: &TagStruct<'_>, prefix: &str) -> Option<String> {
+fn read_named_string_exact(tag_struct: &TagStruct<'_>, expected: &str) -> Option<String> {
     for field in tag_struct.fields() {
         let name = field.name();
-        if name.starts_with(prefix) {
-            if let Some(TagFieldData::StringId(id) | TagFieldData::OldStringId(id)) = field.value()
-            {
-                if !id.string.is_empty() {
-                    return Some(id.string);
+        if field_name_matches(name, expected) {
+            match field.value()? {
+                TagFieldData::StringId(id) | TagFieldData::OldStringId(id) => {
+                    if !id.string.is_empty() {
+                        return Some(id.string);
+                    }
                 }
+                TagFieldData::String(value) | TagFieldData::LongString(value) => {
+                    if !value.is_empty() {
+                        return Some(value);
+                    }
+                }
+                _ => {}
             }
         }
     }
     None
+}
+
+fn field_name_matches(actual: &str, expected: &str) -> bool {
+    actual.eq_ignore_ascii_case(expected)
+        || clean_field_name(actual).eq_ignore_ascii_case(expected)
+        || clean_field_name_basic(actual).eq_ignore_ascii_case(expected)
 }
 
 fn reset_model_preview_selection(
@@ -257,21 +475,75 @@ fn reset_model_preview_selection(
 ) {
     state.selected_variant = variant;
     state.region_selections.clear();
+    let selected_variant = variant.and_then(|idx| data.variants.get(idx));
+    let variant_aliases = selected_variant
+        .map(|variant| variant_permutation_aliases(&variant.name))
+        .unwrap_or_default();
     for region in &data.preview.regions {
         let default_perm = region.permutations.first().cloned().unwrap_or_default();
-        let permutation = variant
-            .and_then(|idx| data.variants.get(idx))
-            .and_then(|v| v.regions.get(&region.name))
-            .cloned()
-            .filter(|name| region.permutations.iter().any(|p| p == name))
+        let variant_perm = selected_variant.and_then(|v| v.regions.get(&region.name));
+        let alias_perm = matching_variant_permutation(region, &variant_aliases);
+        let explicit_perm = variant_perm
+            .filter(|name| region.permutations.iter().any(|p| p == *name))
+            .cloned();
+        let fallback_for_unmapped = selected_variant
+            .filter(|variant| !variant.has_explicit_regions)
+            .and(Some(default_perm.clone()));
+        let permutation = alias_perm
+            .clone()
+            .or(explicit_perm.clone())
+            .or(fallback_for_unmapped.clone())
             .unwrap_or(default_perm);
+        let enabled = match selected_variant {
+            Some(variant) => {
+                alias_perm.is_some()
+                    || explicit_perm.is_some()
+                    || (!variant.has_explicit_regions && !region.permutations.is_empty())
+            }
+            None => !region.permutations.is_empty(),
+        };
         state.region_selections.insert(
             region.name.clone(),
             ModelRegionSelection {
-                enabled: !region.permutations.is_empty(),
+                enabled,
                 permutation,
             },
         );
+    }
+}
+
+fn matching_variant_permutation(
+    region: &RenderModelPreviewRegion,
+    aliases: &[String],
+) -> Option<String> {
+    aliases.iter().find_map(|alias| {
+        region
+            .permutations
+            .iter()
+            .find(|permutation| permutation.eq_ignore_ascii_case(alias))
+            .cloned()
+    })
+}
+
+fn variant_permutation_aliases(name: &str) -> Vec<String> {
+    let mut aliases = Vec::new();
+    push_unique_alias(&mut aliases, name);
+    if let Some((base, _)) = name.rsplit_once('_') {
+        push_unique_alias(&mut aliases, base);
+    }
+    aliases
+}
+
+fn push_unique_alias(aliases: &mut Vec<String>, alias: &str) {
+    let alias = alias.trim();
+    if alias.is_empty() {
+        return;
+    }
+    if !aliases
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(alias))
+    {
+        aliases.push(alias.to_owned());
     }
 }
 

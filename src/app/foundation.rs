@@ -612,8 +612,8 @@ pub(super) fn block_element_content_label(
     element: TagStruct<'_>,
     names: &TagNameIndex,
 ) -> Option<String> {
-    first_tag_reference_label(element, names)
-        .or_else(|| first_named_string_label(element))
+    first_named_string_label(element)
+        .or_else(|| first_tag_reference_label(element, names))
         .or_else(|| first_string_label(element))
         .or_else(|| first_scalar_label(element, names))
 }

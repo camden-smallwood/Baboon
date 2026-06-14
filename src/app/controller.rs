@@ -22,12 +22,12 @@ impl Baboon {
                 }
                 WorkerMessage::SourceLoaded(Ok(mut loaded)) => {
                     // Set terminal work dir to the game kit root (parent of tags/).
-                    self.terminal_work_dir = if let TagSource::LooseFolder { root } = &loaded.source
-                    {
-                        root.parent().map(|p| p.to_owned())
-                    } else {
-                        None
-                    };
+                    self.terminal_work_dir =
+                        if let TagSource::LooseFolder { root, .. } = &loaded.source {
+                            root.parent().map(|p| p.to_owned())
+                        } else {
+                            None
+                        };
                     // Restore the per-kit terminal-open preference for this game.
                     self.terminal_open = loaded
                         .game
@@ -133,7 +133,7 @@ impl Baboon {
                                 source.group_tree =
                                     crate::source::build_group_tree(&source.all_entries);
                                 source.reverse_dependencies = done.reverse_dependencies;
-                                if let TagSource::LooseFolder { root } = &source.source {
+                                if let TagSource::LooseFolder { root, .. } = &source.source {
                                     if !source.all_entries.is_empty()
                                         && let Some(game) = source.game.as_deref()
                                     {
@@ -196,7 +196,7 @@ impl Baboon {
                                 self.status = format!("Index complete: {n} tags");
                                 // Persist the index in the background so the
                                 // next launch can skip the scan entirely.
-                                if let (Some(game), TagSource::LooseFolder { root }) =
+                                if let (Some(game), TagSource::LooseFolder { root, .. }) =
                                     (source.game.clone(), &source.source)
                                 {
                                     let root = root.clone();
@@ -447,7 +447,7 @@ impl Baboon {
     }
 
     pub(super) fn loaded_tags_root(&self) -> Option<PathBuf> {
-        let TagSource::LooseFolder { root } = &self.source.as_ref()?.source else {
+        let TagSource::LooseFolder { root, .. } = &self.source.as_ref()?.source else {
             return None;
         };
         Some(root.clone())
@@ -460,7 +460,7 @@ impl Baboon {
             source.entries.push(entry.clone());
             source.all_entries.retain(|existing| existing.key != key);
             source.all_entries.push(entry.clone());
-            if let TagSource::LooseFolder { root } = &source.source {
+            if let TagSource::LooseFolder { root, .. } = &source.source {
                 if let Ok(tree) = crate::source::build_folder_directory_tree(root) {
                     source.tree = tree;
                 }
@@ -491,7 +491,7 @@ impl Baboon {
         let Some(source) = self.source.as_ref() else {
             return;
         };
-        let TagSource::LooseFolder { root } = &source.source else {
+        let TagSource::LooseFolder { root, .. } = &source.source else {
             return; // monolithic/single-file already have all entries
         };
         let root = root.clone();
@@ -958,7 +958,7 @@ impl Baboon {
         let Some(source_data) = self.source.as_ref() else {
             return;
         };
-        let TagSource::LooseFolder { root } = &source_data.source else {
+        let TagSource::LooseFolder { root, .. } = &source_data.source else {
             return;
         };
         let root = root.clone();
@@ -1307,8 +1307,8 @@ impl Baboon {
             self.status = "Load the selected tag before saving".to_owned();
             return;
         };
-        if doc.tag.endian != Endian::Le {
-            self.status = "Only little-endian loose tags can be saved".to_owned();
+        if doc.tag.classic_engine().is_none() && doc.tag.endian != Endian::Le {
+            self.status = "Only little-endian MCC tags can be saved".to_owned();
             return;
         }
         let TagEntryLocation::LooseFile(path) = &entry.location else {
@@ -1339,8 +1339,8 @@ impl Baboon {
             self.status = "Load the selected tag before saving".to_owned();
             return;
         };
-        if doc.tag.endian != Endian::Le {
-            self.status = "Only little-endian tags can be saved".to_owned();
+        if doc.tag.classic_engine().is_none() && doc.tag.endian != Endian::Le {
+            self.status = "Only little-endian MCC tags can be saved".to_owned();
             return;
         }
 
@@ -1449,7 +1449,7 @@ impl Baboon {
     }
 
     pub(super) fn editing_kit_root(&self) -> Option<PathBuf> {
-        let TagSource::LooseFolder { root } = &self.source.as_ref()?.source else {
+        let TagSource::LooseFolder { root, .. } = &self.source.as_ref()?.source else {
             return None;
         };
         if root
@@ -1475,6 +1475,8 @@ impl Baboon {
     /// the generic name when the game is unknown.
     pub(super) fn tag_test_executable(&self) -> &'static str {
         match self.source.as_ref().and_then(|s| s.game.as_deref()) {
+            Some("haloce_mcc") => "halo_tag_test.exe",
+            Some("halo2_mcc") => "halo2_tag_test.exe",
             Some("halo3_mcc") => "halo3_tag_test.exe",
             Some("halo3odst_mcc") => "atlas_tag_test.exe",
             Some("haloreach_mcc") => "reach_tag_test.exe",
@@ -1561,7 +1563,7 @@ impl Baboon {
             return;
         };
         let root = match self.source.as_ref().map(|s| &s.source) {
-            Some(TagSource::LooseFolder { root }) => root.clone(),
+            Some(TagSource::LooseFolder { root, .. }) => root.clone(),
             _ => {
                 self.status = "Open requires a loose-folder source".to_owned();
                 return;
@@ -1646,7 +1648,7 @@ impl Baboon {
             return;
         };
         let Some(tags_root) = (match &source {
-            TagSource::LooseFolder { root } => Some(root.as_path()),
+            TagSource::LooseFolder { root, .. } => Some(root.as_path()),
             _ => None,
         }) else {
             self.status = "Bitmap reimport requires a loose tags folder".to_owned();
@@ -1818,7 +1820,7 @@ impl Baboon {
                             .source
                             .as_ref()
                             .and_then(|source| match &source.source {
-                                TagSource::LooseFolder { root } => Some(root.as_path()),
+                                TagSource::LooseFolder { root, .. } => Some(root.as_path()),
                                 _ => None,
                             }),
                         editable: is_editable_tag(&entry, &doc.tag),
@@ -2735,8 +2737,14 @@ fn run_folder_refactor_job(
         reverse_dependencies = None;
     }
     if move_folder && reverse_dependencies.is_none() {
+        let dependency_source = TagSource::LooseFolder {
+            root: root.clone(),
+            game: game.clone(),
+            definitions_root: locate_definitions_root(),
+        };
         reverse_dependencies = Some(build_reverse_dependency_index(
             &root,
+            &dependency_source,
             &all_entries_before,
             &label,
             tx,
@@ -2750,6 +2758,11 @@ fn run_folder_refactor_job(
                 .join("tag_dependency_list.json")
         })
         .filter(|path| path.is_file());
+    let rewrite_source = TagSource::LooseFolder {
+        root: root.clone(),
+        game: game.clone(),
+        definitions_root: locate_definitions_root(),
+    };
 
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)
@@ -2784,6 +2797,7 @@ fn run_folder_refactor_job(
             None,
         );
         rewrite_references_in_entries(
+            &rewrite_source,
             &rewrite_entries,
             &rewrites,
             &label,
@@ -2793,6 +2807,7 @@ fn run_folder_refactor_job(
     } else {
         send_folder_refactor_progress(tx, &label, "Rewriting copied references", None);
         rewrite_references_in_entries(
+            &rewrite_source,
             &new_entries,
             &rewrites,
             &label,
@@ -2823,8 +2838,14 @@ fn run_folder_refactor_job(
         HashMap::new()
     };
     if let Some(index) = reverse_dependencies.as_mut() {
+        let dependency_source = TagSource::LooseFolder {
+            root: root.clone(),
+            game: game.clone(),
+            definitions_root: locate_definitions_root(),
+        };
         refresh_reverse_dependency_index_after_refactor(
             index,
+            &dependency_source,
             move_folder,
             &old_entries,
             &new_entries,
@@ -3085,6 +3106,7 @@ fn natural_entry_order(entry: &TagEntry) -> String {
 }
 
 fn rewrite_references_in_entries(
+    source: &TagSource,
     entries: &[TagEntry],
     rewrites: &HashMap<(u32, String), String>,
     label: &str,
@@ -3130,13 +3152,14 @@ fn rewrite_references_in_entries(
             ),
             None,
         );
-        let mut tag = TagFile::read_from_bytes(&bytes)
-            .map_err(|error| format!("Could not parse {}: {error}", path.display()))?;
+        let mut tag =
+            read_entry(source, entry).map_err(|error| format!("Could not parse tag: {error}"))?;
         let changed = rewrite_references_in_tag(&mut tag, rewrites);
         if changed == 0 {
             continue;
         }
-        if let Some(schema_path) = dependency_schema_path
+        if tag.classic_engine().is_none()
+            && let Some(schema_path) = dependency_schema_path
             && let Err(error) = tag.rebuild_dependency_list(schema_path)
         {
             let _ = tx.send(WorkerMessage::TerminalLine(format!(
@@ -3155,6 +3178,7 @@ fn rewrite_references_in_entries(
 
 fn build_reverse_dependency_index(
     root: &Path,
+    source: &TagSource,
     entries: &[TagEntry],
     label: &str,
     tx: &Sender<WorkerMessage>,
@@ -3175,7 +3199,7 @@ fn build_reverse_dependency_index(
                 progress,
             );
         }
-        let deps = match read_entry_dependencies(entry) {
+        let deps = match read_entry_dependencies(source, entry) {
             Ok(deps) => deps,
             Err(error) => {
                 let _ = tx.send(WorkerMessage::TerminalLine(format!(
@@ -3197,6 +3221,7 @@ fn build_reverse_dependency_index(
 
 fn refresh_reverse_dependency_index_after_refactor(
     index: &mut ReverseDependencyIndex,
+    source: &TagSource,
     moved: bool,
     old_entries: &[TagEntry],
     new_entries: &[TagEntry],
@@ -3221,13 +3246,16 @@ fn refresh_reverse_dependency_index_after_refactor(
         let Some(entry) = entries_by_key.get(key.as_str()) else {
             continue;
         };
-        if let Ok(deps) = read_entry_dependencies(entry) {
+        if let Ok(deps) = read_entry_dependencies(source, entry) {
             index.set_tag_dependencies(entry.key.clone(), deps);
         }
     }
 }
 
-fn read_entry_dependencies(entry: &TagEntry) -> Result<Vec<DependencyRef>, String> {
+fn read_entry_dependencies(
+    source: &TagSource,
+    entry: &TagEntry,
+) -> Result<Vec<DependencyRef>, String> {
     let TagEntryLocation::LooseFile(path) = &entry.location else {
         return Ok(Vec::new());
     };
@@ -3242,7 +3270,7 @@ fn read_entry_dependencies(entry: &TagEntry) -> Result<Vec<DependencyRef>, Strin
             })
             .collect());
     }
-    let tag = TagFile::read(path).map_err(|error| format!("Could not parse tag: {error}"))?;
+    let tag = read_entry(source, entry).map_err(|error| format!("Could not parse tag: {error}"))?;
     let mut refs = Vec::new();
     collect_tag_references(tag.root(), "", &mut refs);
     Ok(refs

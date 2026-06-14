@@ -319,6 +319,322 @@ pub(super) fn build_shader_editor_model(
     })
 }
 
+pub(super) fn build_classic_shader_editor_model(
+    tag: &TagFile,
+    names: &TagNameIndex,
+) -> Option<ShaderEditorModel> {
+    tag.classic_engine()?;
+
+    let mut general_rows = Vec::new();
+    let mut sections = Vec::new();
+    for field in tag.root().fields() {
+        let path = escape_field_path_segment(field.name());
+        if let Some(row) = classic_shader_row_from_field(field, &path, "", names) {
+            general_rows.push(row);
+            continue;
+        }
+        if let Some(nested) = field.as_struct() {
+            let mut rows = Vec::new();
+            push_classic_shader_rows(nested, &path, "", names, &mut rows);
+            if !rows.is_empty() {
+                sections.push(ShaderEditorSection {
+                    title: clean_field_name(field.name()).to_ascii_uppercase(),
+                    option_name: String::new(),
+                    rows,
+                });
+            }
+            continue;
+        }
+        if let Some(block) = field.as_block() {
+            for (index, element) in block.iter().enumerate() {
+                let mut rows = Vec::new();
+                let block_path = format!("{path}[{index}]");
+                push_classic_shader_rows(element, &block_path, "", names, &mut rows);
+                if !rows.is_empty() {
+                    let suffix = if block.len() > 1 {
+                        format!(" [{}]", index)
+                    } else {
+                        String::new()
+                    };
+                    sections.push(ShaderEditorSection {
+                        title: format!(
+                            "{}{}",
+                            clean_field_name(field.name()).to_ascii_uppercase(),
+                            suffix
+                        ),
+                        option_name: String::new(),
+                        rows,
+                    });
+                }
+            }
+        }
+    }
+
+    if !general_rows.is_empty() {
+        sections.insert(
+            0,
+            ShaderEditorSection {
+                title: "SHADER".to_owned(),
+                option_name: String::new(),
+                rows: general_rows,
+            },
+        );
+    }
+    if sections.is_empty() {
+        return None;
+    }
+
+    Some(ShaderEditorModel {
+        has_material_row: false,
+        global_material_type: String::new(),
+        global_material_edit_path: String::new(),
+        definition_path: String::new(),
+        shader_template_path: None,
+        categories: Vec::new(),
+        sections,
+        atmosphere_flags: ShaderFlagsRow {
+            label: String::new(),
+            path: String::new(),
+            raw: 0,
+            options: Vec::new(),
+        },
+        custom_fog_setting_index: empty_shader_grid_row(),
+        sort_layer: empty_shader_grid_row(),
+    })
+}
+
+fn push_classic_shader_rows(
+    tag_struct: TagStruct<'_>,
+    path_prefix: &str,
+    label_prefix: &str,
+    names: &TagNameIndex,
+    rows: &mut Vec<ShaderGridRow>,
+) {
+    for field in tag_struct.fields() {
+        let path = append_field_path(path_prefix, &escape_field_path_segment(field.name()));
+        if let Some(row) = classic_shader_row_from_field(field, &path, label_prefix, names) {
+            rows.push(row);
+            continue;
+        }
+        let label = classic_nested_label(label_prefix, field.name());
+        if let Some(nested) = field.as_struct() {
+            push_classic_shader_rows(nested, &path, &label, names, rows);
+        } else if let Some(block) = field.as_block() {
+            for (index, element) in block.iter().enumerate() {
+                let block_path = format!("{path}[{index}]");
+                let block_label = if block.len() > 1 {
+                    format!("{label} {index}")
+                } else {
+                    label.clone()
+                };
+                push_classic_shader_rows(element, &block_path, &block_label, names, rows);
+            }
+        }
+    }
+}
+
+fn classic_shader_row_from_field(
+    field: TagField<'_>,
+    path: &str,
+    label_prefix: &str,
+    names: &TagNameIndex,
+) -> Option<ShaderGridRow> {
+    if let Some(function) = field.as_function() {
+        return Some(shader_function_grid_row(
+            classic_nested_label(label_prefix, field.name()),
+            FunctionView::from_function(function),
+        ));
+    }
+    let value = field.value()?;
+    if matches!(
+        value,
+        TagFieldData::Data(_) | TagFieldData::ApiInterop(_) | TagFieldData::Custom(_)
+    ) {
+        return None;
+    }
+    let label = classic_nested_label(label_prefix, field.name());
+    let formatted = format_value(names, &value, false);
+    let color = color_popup_for_value(&label, &value, &formatted);
+    let edit = classic_shader_row_edit(path, &value, &formatted);
+    let value_kind = if is_none_like_value(&formatted) {
+        "default"
+    } else {
+        "value"
+    };
+    Some(ShaderGridRow {
+        label,
+        default_cell: None,
+        value_cell: ShaderGridCell {
+            text: if color.is_some() {
+                "color: RGB".to_owned()
+            } else {
+                formatted
+            },
+            value_kind,
+            color,
+        },
+        fill: material_row_tint(&value),
+        parameter_type: Some(classic_shader_value_kind(&value).to_owned()),
+        function: None,
+        edit,
+        context_menu: None,
+        create_anim_op: None,
+        constant_function_view: None,
+    })
+}
+
+fn classic_shader_row_edit(
+    path: &str,
+    value: &TagFieldData,
+    formatted: &str,
+) -> Option<ShaderRowEdit> {
+    match value {
+        TagFieldData::RealRgbColor(color) => Some(ShaderRowEdit {
+            path: path.to_owned(),
+            current: format!("{},{},{},1", color.red, color.green, color.blue),
+            kind: ShaderRowEditKind::ColorField { argb: false },
+        }),
+        TagFieldData::RealArgbColor(color) => Some(ShaderRowEdit {
+            path: path.to_owned(),
+            current: format!(
+                "{},{},{},{}",
+                color.red, color.green, color.blue, color.alpha
+            ),
+            kind: ShaderRowEditKind::ColorField { argb: true },
+        }),
+        TagFieldData::RgbColor(color) => {
+            let raw = color.0;
+            Some(ShaderRowEdit {
+                path: path.to_owned(),
+                current: format!(
+                    "{},{},{},1",
+                    byte_to_float(((raw >> 16) & 0xFF) as u8),
+                    byte_to_float(((raw >> 8) & 0xFF) as u8),
+                    byte_to_float((raw & 0xFF) as u8)
+                ),
+                kind: ShaderRowEditKind::ColorField { argb: false },
+            })
+        }
+        TagFieldData::ArgbColor(color) => {
+            let raw = color.0;
+            Some(ShaderRowEdit {
+                path: path.to_owned(),
+                current: format!(
+                    "{},{},{},{}",
+                    byte_to_float(((raw >> 16) & 0xFF) as u8),
+                    byte_to_float(((raw >> 8) & 0xFF) as u8),
+                    byte_to_float((raw & 0xFF) as u8),
+                    byte_to_float(((raw >> 24) & 0xFF) as u8)
+                ),
+                kind: ShaderRowEditKind::ColorField { argb: true },
+            })
+        }
+        TagFieldData::TagReference(reference) => {
+            let (group_tag, name) = reference.group_tag_and_name.as_ref()?;
+            if *group_tag != u32::from_be_bytes(*b"bitm") {
+                return None;
+            }
+            let current = if name.is_empty() {
+                "NONE".to_owned()
+            } else {
+                format!("{}.bitmap", name.replace('\\', "/"))
+            };
+            Some(ShaderRowEdit {
+                path: path.to_owned(),
+                current,
+                kind: ShaderRowEditKind::BitmapRef {
+                    group_tag: *group_tag,
+                    create: None,
+                },
+            })
+        }
+        TagFieldData::Real(value)
+        | TagFieldData::RealSlider(value)
+        | TagFieldData::RealFraction(value)
+        | TagFieldData::Angle(value) => Some(ShaderRowEdit {
+            path: path.to_owned(),
+            current: value.to_string(),
+            kind: ShaderRowEditKind::Scalar,
+        }),
+        TagFieldData::CharInteger(value) => classic_int_edit(path, *value as i64, formatted),
+        TagFieldData::ShortInteger(value) => classic_int_edit(path, *value as i64, formatted),
+        TagFieldData::LongInteger(value) => classic_int_edit(path, *value as i64, formatted),
+        TagFieldData::ByteInteger(value) => classic_int_edit(path, *value as i64, formatted),
+        TagFieldData::WordInteger(value) => classic_int_edit(path, *value as i64, formatted),
+        TagFieldData::DwordInteger(value) => classic_int_edit(path, *value as i64, formatted),
+        TagFieldData::CharEnum { value, .. } => classic_int_edit(path, *value as i64, formatted),
+        TagFieldData::ShortEnum { value, .. } => classic_int_edit(path, *value as i64, formatted),
+        TagFieldData::LongEnum { value, .. } => classic_int_edit(path, *value as i64, formatted),
+        _ => None,
+    }
+}
+
+fn classic_int_edit(path: &str, value: i64, formatted: &str) -> Option<ShaderRowEdit> {
+    let normalized = formatted.trim().to_ascii_lowercase();
+    let kind = if matches!(normalized.as_str(), "true" | "false") {
+        ShaderRowEditKind::Bool { create: None }
+    } else {
+        ShaderRowEditKind::Int
+    };
+    Some(ShaderRowEdit {
+        path: path.to_owned(),
+        current: value.to_string(),
+        kind,
+    })
+}
+
+fn classic_shader_value_kind(value: &TagFieldData) -> &'static str {
+    match value {
+        TagFieldData::TagReference(_) => "tag reference",
+        TagFieldData::RealRgbColor(_)
+        | TagFieldData::RealArgbColor(_)
+        | TagFieldData::RgbColor(_)
+        | TagFieldData::ArgbColor(_) => "color",
+        TagFieldData::Real(_)
+        | TagFieldData::RealSlider(_)
+        | TagFieldData::RealFraction(_)
+        | TagFieldData::Angle(_) => "real",
+        TagFieldData::CharEnum { .. }
+        | TagFieldData::ShortEnum { .. }
+        | TagFieldData::LongEnum { .. } => "enum",
+        TagFieldData::ByteFlags { .. }
+        | TagFieldData::WordFlags { .. }
+        | TagFieldData::LongFlags { .. }
+        | TagFieldData::ByteBlockFlags(_)
+        | TagFieldData::WordBlockFlags(_)
+        | TagFieldData::LongBlockFlags(_) => "flags",
+        _ => "value",
+    }
+}
+
+fn classic_nested_label(prefix: &str, name: &str) -> String {
+    let name = clean_field_name(name);
+    if prefix.is_empty() {
+        name
+    } else {
+        format!("{prefix} {name}")
+    }
+}
+
+fn empty_shader_grid_row() -> ShaderGridRow {
+    ShaderGridRow {
+        label: String::new(),
+        default_cell: None,
+        value_cell: ShaderGridCell {
+            text: String::new(),
+            value_kind: "value",
+            color: None,
+        },
+        fill: material_data_row(),
+        parameter_type: None,
+        function: None,
+        edit: None,
+        context_menu: None,
+        create_anim_op: None,
+        constant_function_view: None,
+    }
+}
+
 pub(super) fn render_method_flags_mask(render_method: &RenderMethod) -> u64 {
     let mut mask = 0u64;
     for flag in render_method.flags.get() {
@@ -2135,23 +2451,25 @@ pub(super) fn draw_shader_editor_model(
         draw_shader_grid_row(ui, &material_row, 0, color_popup, function_popup, edit);
     }
 
-    let definition_row = ShaderGridRow {
-        label: "definition".to_owned(),
-        default_cell: None,
-        value_cell: ShaderGridCell {
-            text: format!("{}.render_method_definition", model.definition_path),
-            value_kind: "value",
-            color: None,
-        },
-        fill: material_ref_row(),
-        parameter_type: Some("tag reference".to_owned()),
-        function: None,
-        edit: None,
-        context_menu: None,
-        create_anim_op: None,
-        constant_function_view: None,
-    };
-    draw_shader_grid_row(ui, &definition_row, 0, color_popup, function_popup, edit);
+    if !model.definition_path.is_empty() {
+        let definition_row = ShaderGridRow {
+            label: "definition".to_owned(),
+            default_cell: None,
+            value_cell: ShaderGridCell {
+                text: format!("{}.render_method_definition", model.definition_path),
+                value_kind: "value",
+                color: None,
+            },
+            fill: material_ref_row(),
+            parameter_type: Some("tag reference".to_owned()),
+            function: None,
+            edit: None,
+            context_menu: None,
+            create_anim_op: None,
+            constant_function_view: None,
+        };
+        draw_shader_grid_row(ui, &definition_row, 0, color_popup, function_popup, edit);
+    }
 
     if let Some(template_path) = model.shader_template_path.as_deref() {
         let template_row = ShaderGridRow {
@@ -2173,9 +2491,11 @@ pub(super) fn draw_shader_editor_model(
         draw_shader_grid_row(ui, &template_row, 0, color_popup, function_popup, edit);
     }
 
-    draw_shader_grid_section_header(ui, "CATEGORIES");
-    for category in &model.categories {
-        draw_shader_category_row(ui, category, edit);
+    if !model.categories.is_empty() {
+        draw_shader_grid_section_header(ui, "CATEGORIES");
+        for category in &model.categories {
+            draw_shader_category_row(ui, category, edit);
+        }
     }
 
     for section in &model.sections {
@@ -2204,19 +2524,29 @@ pub(super) fn draw_shader_editor_model(
         }
     }
 
-    draw_shader_grid_section_header(ui, "ATMOSPHERE PROPERTIES");
-    draw_shader_flags_row(ui, &model.atmosphere_flags, edit);
-    draw_shader_grid_row(
-        ui,
-        &model.custom_fog_setting_index,
-        0,
-        color_popup,
-        function_popup,
-        edit,
-    );
+    if !model.atmosphere_flags.options.is_empty()
+        || !model.custom_fog_setting_index.label.is_empty()
+    {
+        draw_shader_grid_section_header(ui, "ATMOSPHERE PROPERTIES");
+        if !model.atmosphere_flags.options.is_empty() {
+            draw_shader_flags_row(ui, &model.atmosphere_flags, edit);
+        }
+        if !model.custom_fog_setting_index.label.is_empty() {
+            draw_shader_grid_row(
+                ui,
+                &model.custom_fog_setting_index,
+                0,
+                color_popup,
+                function_popup,
+                edit,
+            );
+        }
+    }
 
-    draw_shader_grid_section_header(ui, "SORTING PROPERTIES");
-    draw_shader_grid_row(ui, &model.sort_layer, 0, color_popup, function_popup, edit);
+    if !model.sort_layer.label.is_empty() {
+        draw_shader_grid_section_header(ui, "SORTING PROPERTIES");
+        draw_shader_grid_row(ui, &model.sort_layer, 0, color_popup, function_popup, edit);
+    }
 }
 
 pub(super) fn draw_shader_category_row(

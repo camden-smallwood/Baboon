@@ -1548,7 +1548,7 @@ mod tests {
 
     #[test]
     fn model_variant_ops_create_update_and_drop_regions() {
-        let mut tag = TagFile::new("blam-tags/definitions/halo2_mcc/model.json").unwrap();
+        let mut tag = TagFile::new("definitions/halo2_mcc/model.json").unwrap();
         let mut dirty = false;
 
         let status = apply_model_variant_ops(

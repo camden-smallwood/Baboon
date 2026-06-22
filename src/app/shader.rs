@@ -82,6 +82,7 @@ pub(super) enum ShaderRowEditKind {
         group_tag: u32,
         create: Option<ShaderParamCreateTarget>,
     },
+    ShaderTemplateRef,
     /// Boolean checkbox backed by an existing field or a new shader parameter.
     Bool {
         create: Option<ShaderParamCreateTarget>,
@@ -1509,6 +1510,12 @@ fn h2_legacy_animation_constant_row(
     let function_path = append_field_path(&path, "function");
     let block_path = h2_function_data_path(function_struct, &function_path)?;
     let bytes = halo2_function_bytes_from_struct(function_struct)?;
+    if is_h2_legacy_nonconstant_function_data(&bytes) {
+        return Some(h2_legacy_function_placeholder_row(
+            label,
+            h2_legacy_function_view(anim, function_struct, &function_path),
+        ));
+    }
 
     if animation_type == 12 {
         let rgba = h2_legacy_constant_color(&bytes)?;
@@ -1570,6 +1577,120 @@ fn h2_legacy_animation_constant_row(
         create_anim_op: None,
         constant_function_view: synthetic,
     })
+}
+
+fn h2_legacy_function_placeholder_row(
+    label: &str,
+    function: Option<FunctionView>,
+) -> ShaderGridRow {
+    ShaderGridRow {
+        label: label.to_owned(),
+        default_cell: Some(ShaderGridCell {
+            text: String::new(),
+            value_kind: "default",
+            color: None,
+        }),
+        value_cell: ShaderGridCell {
+            text: "<function data goes here>".to_owned(),
+            value_kind: "value",
+            color: None,
+        },
+        fill: material_function_row(),
+        parameter_type: Some("function".to_owned()),
+        function: None,
+        edit: None,
+        context_menu: None,
+        create_anim_op: None,
+        constant_function_view: function,
+    }
+}
+
+fn h2_legacy_function_view(
+    animation_property: TagStruct<'_>,
+    function_struct: TagStruct<'_>,
+    function_path: &str,
+) -> Option<FunctionView> {
+    let data_block_path = h2_function_data_path(function_struct, function_path)?;
+    let bytes = halo2_function_bytes_from_struct(function_struct)?;
+    let function =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| TagFunction::parse(&bytes)))
+            .ok()
+            .and_then(Result::ok)
+            .or_else(|| {
+                decode_hex(&constant_function_hex(0.0))
+                    .ok()
+                    .and_then(|data| TagFunction::parse(&data).ok())
+            })?;
+    let mut view = FunctionView::from_function(function).with_h2_scalar_ui();
+    view.input_name = animation_property
+        .read_string_id("input name")
+        .unwrap_or_default();
+    view.range_name = animation_property
+        .read_string_id("range name")
+        .unwrap_or_default();
+    view.output_index = animation_property
+        .read_int_any("type")
+        .and_then(|value| i32::try_from(value).ok());
+    view.time_period_in_seconds = animation_property
+        .read_real("time period")
+        .or_else(|| animation_property.read_real("time period in seconds"))
+        .unwrap_or_default();
+
+    let animation_path = function_path
+        .rsplit_once('/')
+        .map(|(base, _)| base)
+        .unwrap_or("");
+    let sibling_path = |name: &str| {
+        if animation_path.is_empty() {
+            escape_field_path_segment(name)
+        } else {
+            append_field_path(animation_path, &escape_field_path_segment(name))
+        }
+    };
+    let time_field = if animation_property.field("time period").is_some() {
+        "time period"
+    } else if animation_property.field("time period in seconds").is_some() {
+        "time period in seconds"
+    } else {
+        ""
+    };
+
+    Some(
+        view.with_edit(FunctionEditPaths {
+            data: FunctionDataStorage::Halo2ByteBlock(data_block_path),
+            parameter_type: animation_property
+                .field("type")
+                .and_then(|field| field.value())
+                .is_some()
+                .then(|| sibling_path("type"))
+                .unwrap_or_default(),
+            input_name: animation_property
+                .field("input name")
+                .and_then(|field| field.value())
+                .is_some()
+                .then(|| sibling_path("input name"))
+                .unwrap_or_default(),
+            range_name: animation_property
+                .field("range name")
+                .and_then(|field| field.value())
+                .is_some()
+                .then(|| sibling_path("range name"))
+                .unwrap_or_default(),
+            time_period: (!time_field.is_empty()
+                && animation_property
+                    .field(time_field)
+                    .and_then(|field| field.value())
+                    .is_some())
+            .then(|| sibling_path(time_field))
+            .unwrap_or_default(),
+            block_path: animation_path.to_owned(),
+            block_index: animation_path
+                .rsplit_once('[')
+                .and_then(|(_, rest)| rest.strip_suffix(']'))
+                .and_then(|index| index.parse::<usize>().ok())
+                .unwrap_or(0),
+        }),
+    )
 }
 
 fn h2_synthetic_function_view_for_constant_scalar(
@@ -2093,6 +2214,9 @@ fn h2_function_view_from_animation_property(
 ) -> Option<FunctionView> {
     let data_block_path = h2_function_data_path(function_struct, function_path)?;
     let bytes = halo2_function_bytes_from_struct(function_struct)?;
+    if is_h2_legacy_function_data(&bytes) {
+        return None;
+    }
     let function = TagFunction::parse(&bytes).ok()?;
     let mut view = FunctionView::from_function(function);
     view.input_name = animation_property
@@ -2393,6 +2517,7 @@ fn shader_row_edit_kind_name(kind: &ShaderRowEditKind) -> &'static str {
         ShaderRowEditKind::Int => "int",
         ShaderRowEditKind::StringId => "string_id",
         ShaderRowEditKind::BitmapRef { .. } => "bitmap_ref",
+        ShaderRowEditKind::ShaderTemplateRef => "shader_template_ref",
         ShaderRowEditKind::Bool { .. } => "bool",
         ShaderRowEditKind::Enum(_) => "enum",
         ShaderRowEditKind::FunctionScalar { .. } => "function_scalar",
@@ -2455,6 +2580,25 @@ pub(super) fn h2_template_row_value_color_for_test(
             let color = color.color32();
             (color.r(), color.g(), color.b(), color.a())
         })
+}
+
+#[cfg(test)]
+pub(super) fn h2_template_row_function_data_path_for_test(
+    shader: &TagFile,
+    template: &TagFile,
+    label: &str,
+) -> Option<String> {
+    let rows = h2_template_parameter_rows(shader.root(), template.root(), &TagNameIndex::default());
+    let row = rows.into_iter().find(|row| row.label == label)?;
+    let view = row
+        .function
+        .as_ref()
+        .or(row.constant_function_view.as_ref())?;
+    let edit = view.edit.as_ref()?;
+    let FunctionDataStorage::Halo2ByteBlock(path) = &edit.data else {
+        return None;
+    };
+    Some(path.clone())
 }
 
 #[cfg(test)]
@@ -2565,6 +2709,21 @@ fn classic_shader_row_edit(
                 });
             };
             if *group_tag != u32::from_be_bytes(*b"bitm") {
+                if *group_tag == u32::from_be_bytes(*b"stem") {
+                    let current = if name.is_empty() {
+                        "NONE".to_owned()
+                    } else {
+                        format!(
+                            "{}.shader_template",
+                            h2_normalize_shader_template_reference(name).replace('\\', "/")
+                        )
+                    };
+                    return Some(ShaderRowEdit {
+                        path: path.to_owned(),
+                        current,
+                        kind: ShaderRowEditKind::ShaderTemplateRef,
+                    });
+                }
                 return Some(ShaderRowEdit {
                     path: path.to_owned(),
                     current: formatted.to_owned(),
@@ -3030,7 +3189,15 @@ pub(super) fn constant_function_hex(v: f32) -> String {
 }
 
 pub(super) fn is_h2_legacy_constant_function_data(data: &[u8]) -> bool {
-    data.len() >= 8 && matches!(data.first(), Some(1))
+    data.len() >= 8 && is_h2_legacy_function_data(data) && matches!(data.first(), Some(1))
+}
+
+fn is_h2_legacy_function_data(data: &[u8]) -> bool {
+    !data.is_empty() && data.len() != 32
+}
+
+fn is_h2_legacy_nonconstant_function_data(data: &[u8]) -> bool {
+    is_h2_legacy_function_data(data) && !is_h2_legacy_constant_function_data(data)
 }
 
 fn h2_legacy_constant_scalar(data: &[u8]) -> Option<f32> {
@@ -5370,6 +5537,14 @@ pub(super) fn draw_shader_grid_row(
             )
             .on_hover_text("Open function graph editor")
             .clicked()
+            || ui
+                .interact(
+                    value_rect,
+                    ui.make_persistent_id(format!("shader_cfn_value_open:{}", row.label)),
+                    Sense::click(),
+                )
+                .on_hover_text("Double-click to open function graph editor")
+                .double_clicked()
         {
             *function_popup = Some(FunctionPopup::new(
                 tag_key.to_owned(),
@@ -5716,6 +5891,122 @@ pub(super) fn draw_shader_editable_value(
                     let buf = edit.buffers.entry(buffer_key).or_insert_with(String::new);
                     *buf = rel.clone();
                     push_shader_value_edit(edit, row_edit, create.as_ref(), rel);
+                }
+            }
+        }
+
+        // Shader template tag reference → text box + Open + "..." browse button.
+        ShaderRowEditKind::ShaderTemplateRef => {
+            let current = row_edit.current.clone();
+            let browse_rect = egui::Rect::from_min_size(
+                rect.right_top() - Vec2::new(26.0, 0.0),
+                Vec2::new(24.0, rect.height()),
+            );
+            let open_rect = egui::Rect::from_min_size(
+                rect.right_top() - Vec2::new(70.0, 0.0),
+                Vec2::new(40.0, rect.height()),
+            );
+            let text_rect = egui::Rect::from_min_size(
+                rect.left_top(),
+                Vec2::new((rect.width() - 72.0).max(40.0), rect.height()),
+            );
+            let cleaned = sanitize_ref_path(&current);
+            let open_ref = cleaned
+                .strip_suffix(".shader_template")
+                .unwrap_or(&cleaned)
+                .replace('/', "\\");
+            let open_enabled = !open_ref.is_empty() && open_ref != "NONE";
+            ui.painter().rect_filled(
+                open_rect,
+                0.0,
+                if open_enabled {
+                    material_input()
+                } else {
+                    material_disabled_input()
+                },
+            );
+            ui.painter()
+                .rect_stroke(open_rect, 0.0, Stroke::new(1.0, material_input_edge()));
+            ui.painter().text(
+                open_rect.center(),
+                Align2::CENTER_CENTER,
+                "Open",
+                FontId::proportional(11.0),
+                material_text(),
+            );
+            if open_enabled
+                && ui
+                    .interact(
+                        open_rect,
+                        ui.make_persistent_id(format!("shader_template_open:{}", buffer_key)),
+                        Sense::click(),
+                    )
+                    .on_hover_text("Open the referenced shader_template tag")
+                    .clicked()
+            {
+                *edit.open_request = Some(OpenTagRequest {
+                    group_tag: u32::from_be_bytes(*b"stem"),
+                    rel_path: open_ref.clone(),
+                });
+            }
+
+            let id = edit.widget_id(("shader_template_text", &buffer_key));
+            let buffer = edit
+                .buffers
+                .entry(buffer_key.clone())
+                .or_insert_with(|| current.clone());
+            if !ui.memory(|m| m.has_focus(id)) && *buffer != current {
+                *buffer = current.clone();
+            }
+            let mut commit = None;
+            ui.scope_builder(egui::UiBuilder::new().max_rect(text_rect), |ui| {
+                ui.visuals_mut().extreme_bg_color = material_input();
+                let resp = ui.add(
+                    egui::TextEdit::singleline(buffer)
+                        .id(id)
+                        .desired_width(text_rect.width())
+                        .text_color(material_text())
+                        .font(egui::TextStyle::Monospace),
+                );
+                text_edit_cursor_to_start_on_tab_focus(ui, &resp);
+                if resp.lost_focus() && buffer.trim() != current.trim() {
+                    commit = Some(buffer.trim().to_owned());
+                }
+            });
+            if let Some(input) = commit {
+                push_h2_template_reference_edit(edit, row_edit, input);
+            }
+
+            ui.painter().rect_filled(browse_rect, 0.0, material_input());
+            ui.painter()
+                .rect_stroke(browse_rect, 0.0, Stroke::new(1.0, material_input_edge()));
+            ui.painter().text(
+                browse_rect.center(),
+                Align2::CENTER_CENTER,
+                "...",
+                FontId::proportional(11.0),
+                material_text(),
+            );
+            if ui
+                .interact(
+                    browse_rect,
+                    ui.make_persistent_id(format!("shader_template_browse:{}", buffer_key)),
+                    Sense::click(),
+                )
+                .on_hover_text("Browse for a .shader_template tag file")
+                .clicked()
+            {
+                let mut dialog = rfd::FileDialog::new()
+                    .add_filter("Shader template tag", &["shader_template", "stem"])
+                    .set_title("Select Shader Template Tag");
+                if let Some(tags_root) = edit.tags_root {
+                    dialog = dialog.set_directory(tag_reference_start_dir(tags_root, &open_ref));
+                }
+                if let Some(path) = dialog.pick_file() {
+                    let rel = normalize_shader_template_browse_path(&path, edit.tags_root);
+                    let buf = edit.buffers.entry(buffer_key).or_insert_with(String::new);
+                    *buf = rel.clone();
+                    push_h2_template_reference_edit(edit, row_edit, rel);
                 }
             }
         }
@@ -6337,6 +6628,73 @@ pub(super) fn push_shader_value_edit(
     }
 }
 
+fn push_h2_template_reference_edit(
+    edit: &mut FieldEditContext<'_>,
+    row_edit: &ShaderRowEdit,
+    input: String,
+) {
+    let normalized = h2_normalize_shader_template_reference(&sanitize_ref_path(&input));
+    let pending_input = if normalized.is_empty() || normalized.eq_ignore_ascii_case("none") {
+        "none".to_owned()
+    } else {
+        format!("stem:{}", normalized.replace('/', "\\"))
+    };
+    edit.pending.push(PendingFieldEdit {
+        path: row_edit.path.clone(),
+        input: pending_input,
+    });
+
+    if let Some(tags_root) = edit.tags_root {
+        if let Some(allowed_parameter_names) =
+            h2_template_parameter_names_from_reference(tags_root, &normalized)
+        {
+            edit.h2_shader_param_ops
+                .push(H2ShaderParamOp::SwitchTemplate {
+                    parameters_block_path: "parameters".to_owned(),
+                    allowed_parameter_names,
+                });
+        }
+    }
+}
+
+fn h2_template_parameter_names_from_reference(
+    tags_root: &std::path::Path,
+    reference: &str,
+) -> Option<Vec<String>> {
+    let rel = reference.replace('/', "\\");
+    let path = tags_root.join(format!("{rel}.shader_template"));
+    h2_template_parameter_names_from_file(&path)
+}
+
+fn h2_template_parameter_names_from_file(path: &std::path::Path) -> Option<Vec<String>> {
+    let bytes = std::fs::read(path).ok()?;
+    blam_tags::classic::ClassicHeader::parse(&bytes)?;
+    let schema_path = crate::embedded_definitions::definition_path("halo2_mcc", "shader_template")?;
+    let layout = blam_tags::TagLayout::from_json(schema_path).ok()?;
+    let tag = blam_tags::classic::read_classic_tag_file(&bytes, layout).ok()?;
+    Some(h2_template_parameter_names(tag.root()))
+}
+
+fn h2_template_parameter_names(root: TagStruct<'_>) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(categories) = root.field("categories").and_then(|field| field.as_block()) {
+        for category in categories.iter() {
+            if let Some(parameters) = category
+                .field("parameters")
+                .and_then(|field| field.as_block())
+            {
+                for parameter in parameters.iter() {
+                    let name = h2_template_parameter_name(parameter);
+                    if !name.is_empty() {
+                        names.push(name);
+                    }
+                }
+            }
+        }
+    }
+    names
+}
+
 fn h2_template_value_input(field: &str, input: &str) -> String {
     if field == "bitmap"
         && !input.eq_ignore_ascii_case("none")
@@ -6421,6 +6779,15 @@ pub(super) fn normalize_bitmap_browse_path(
     path.file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+pub(super) fn normalize_shader_template_browse_path(
+    path: &std::path::Path,
+    tags_root: Option<&std::path::Path>,
+) -> String {
+    let mut normalized = normalize_bitmap_browse_path(path, tags_root);
+    normalized = h2_normalize_shader_template_reference(&normalized);
+    normalized
 }
 
 pub(super) fn draw_shader_grid_cell(

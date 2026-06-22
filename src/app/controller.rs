@@ -657,7 +657,7 @@ impl Baboon {
         self.loading_tags.insert(key.clone());
         self.status = format!("Loading {}", entry.display_path);
         thread::spawn(move || {
-            let result = read_entry(&source_kind, &entry).map_err(|e| e.to_string());
+            let result = read_entry(&source_kind, &entry).map_err(|error| format!("{error:#}"));
             let _ = tx.send(WorkerMessage::TagLoaded { key, result });
             ctx.request_repaint();
         });

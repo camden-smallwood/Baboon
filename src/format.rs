@@ -72,9 +72,9 @@ impl TagNameIndex {
     ///
     /// These small meta files are vendored under `src/meta/` (copied from the
     /// blam-tags definitions) so the binary stays self-contained now that
-    /// blam-tags is an external crate rather than an in-tree submodule. The
-    /// full per-tag layouts are still loaded from the on-disk `definitions/`
-    /// folder at runtime via [`locate_definitions_root`].
+    /// blam-tags is an external crate rather than an in-tree submodule. Full
+    /// per-game schemas are also embedded by the build script, while an
+    /// external `definitions/` folder can still override them at runtime.
     pub fn embedded_fallback() -> Self {
         const EMBEDDED: &[&str] = &[
             include_str!("meta/halo3_mcc/_meta.json"),

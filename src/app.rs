@@ -67,31 +67,15 @@ mod ui;
 
 #[cfg(test)]
 pub(super) fn test_definition_path(rel: &str) -> PathBuf {
+    if let Some(root) = crate::embedded_definitions::materialized_root() {
+        let embedded = root.join(rel);
+        if embedded.is_file() {
+            return embedded;
+        }
+    }
     let local = Path::new("definitions").join(rel);
     if local.is_file() {
         return local;
-    }
-    let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) else {
-        return local;
-    };
-    let checkouts = Path::new(&home).join(".cargo/git/checkouts");
-    let Ok(entries) = fs::read_dir(checkouts) else {
-        return local;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        if !name.to_string_lossy().starts_with("blam-tags-") {
-            continue;
-        }
-        let Ok(revs) = fs::read_dir(entry.path()) else {
-            continue;
-        };
-        for rev in revs.flatten() {
-            let candidate = rev.path().join("definitions").join(rel);
-            if candidate.is_file() {
-                return candidate;
-            }
-        }
     }
     local
 }
@@ -268,19 +252,11 @@ impl Baboon {
     }
 }
 
-/// Locate the on-disk `definitions/` folder, which carries the per-game tag
-/// layouts and group name → file extension index. Source builds place it at
-/// `definitions/` in the working directory (it is too large — ~1 GB — to vendor
-/// in-repo, and now that blam-tags is an external crate it is no longer carried
-/// by a submodule); release builds may put `definitions` beside the executable.
-/// Without this the name index falls back to the small embedded meta tables, so
-/// tag-reference Open and the geometry Import button still resolve common
-/// groups, but full per-tag layouts won't load.
+/// Locate the runtime definitions root. A user-provided `definitions/` folder
+/// still wins when present, but standalone builds fall back to the embedded
+/// schemas materialized from bytes baked into the Baboon binary.
 pub(super) fn locate_definitions_root() -> PathBuf {
-    for candidate in [
-        PathBuf::from("definitions"),
-        PathBuf::from("blam-tags").join("definitions"),
-    ] {
+    for candidate in [PathBuf::from("definitions")] {
         if candidate.is_dir() {
             return candidate;
         }
@@ -289,16 +265,16 @@ pub(super) fn locate_definitions_root() -> PathBuf {
         let mut dir = exe.parent().map(Path::to_path_buf);
         for _ in 0..4 {
             let Some(d) = dir else { break };
-            for candidate in [
-                d.join("definitions"),
-                d.join("blam-tags").join("definitions"),
-            ] {
+            for candidate in [d.join("definitions")] {
                 if candidate.is_dir() {
                     return candidate;
                 }
             }
             dir = d.parent().map(Path::to_path_buf);
         }
+    }
+    if let Some(root) = crate::embedded_definitions::materialized_root() {
+        return root;
     }
     PathBuf::from("definitions")
 }
@@ -387,6 +363,37 @@ mod tests {
         // Odd-length / invalid input is rejected, not silently truncated.
         assert!(decode_hex("abc").is_err());
         assert!(decode_hex("zz").is_err());
+    }
+
+    #[test]
+    fn embedded_classic_definitions_load_halo2_shader_layout() {
+        let root = crate::embedded_definitions::materialized_root()
+            .expect("embedded definitions materialized");
+        let schema_path = root.join("halo2_mcc").join("shader.json");
+        assert!(schema_path.is_file());
+        TagFile::new(&schema_path).expect("embedded halo2 shader schema loads");
+        let names = TagNameIndex::load_game(&root, "halo2_mcc").expect("embedded halo2 meta loads");
+        assert_eq!(names.name_for(u32::from_be_bytes(*b"shad")), Some("shader"));
+    }
+
+    #[test]
+    fn embedded_definitions_include_all_known_games() {
+        let root = crate::embedded_definitions::materialized_root()
+            .expect("embedded definitions materialized");
+        for game in [
+            "haloce_mcc",
+            "halo2_mcc",
+            "halo2amp_mcc",
+            "halo3_mcc",
+            "halo3odst_mcc",
+            "haloreach_mcc",
+            "halo4_mcc",
+        ] {
+            assert!(
+                root.join(game).join("_meta.json").is_file(),
+                "missing embedded definitions for {game}"
+            );
+        }
     }
 
     #[test]
@@ -723,7 +730,7 @@ mod tests {
         assert_eq!(material_name, ("material name".to_owned(), "string_id"));
 
         let template = shader_row_edit_path_and_kind(&model, "template").unwrap();
-        assert_eq!(template, ("template".to_owned(), "string_id"));
+        assert_eq!(template, ("template".to_owned(), "shader_template_ref"));
 
         let const_value = shader_row_edit_path_and_kind(&model, "diffuse_map").unwrap();
         assert_eq!(
@@ -1202,6 +1209,16 @@ mod tests {
                 data[7] = 255;
                 data
             }),
+            ("noyze1", "0", "5", {
+                let mut data = vec![0; 52];
+                data[0] = 3;
+                data[2] = 0x0a;
+                data[10] = 0x80;
+                data[11] = 0x3f;
+                data[22] = 0x80;
+                data[23] = 0x3f;
+                data
+            }),
         ]
         .into_iter()
         .enumerate()
@@ -1249,10 +1266,13 @@ mod tests {
         )
         .unwrap();
         apply_field_edit(&mut template, "categories[0]/name", "transparent").unwrap();
-        for (index, (name, ty, flags, bitmap_flags)) in
-            [("noyze0", "0", "1", "1"), ("color_sharp", "2", "1", "0")]
-                .into_iter()
-                .enumerate()
+        for (index, (name, ty, flags, bitmap_flags)) in [
+            ("noyze0", "0", "1", "1"),
+            ("color_sharp", "2", "1", "0"),
+            ("noyze1", "0", "1", "4"),
+        ]
+        .into_iter()
+        .enumerate()
         {
             apply_one_block_op(
                 &mut template,
@@ -1272,6 +1292,9 @@ mod tests {
                 bitmap_flags,
             )
             .unwrap();
+            if name == "noyze1" {
+                apply_field_edit(&mut template, &format!("{path}/bitmap type"), "3D").unwrap();
+            }
         }
 
         assert_eq!(
@@ -1290,9 +1313,26 @@ mod tests {
             h2_template_row_edit_kind_for_test(&shader, &template, "color_sharp"),
             Some("h2_function_color")
         );
+        assert_eq!(
+            h2_template_row_value_text_for_test(&shader, &template, "noyze1_translation_y")
+                .as_deref(),
+            Some("<function data goes here>")
+        );
+        assert_eq!(
+            h2_template_row_edit_kind_for_test(&shader, &template, "noyze1_translation_y"),
+            None
+        );
+        assert_eq!(
+            h2_template_row_function_data_path_for_test(&shader, &template, "noyze1_translation_y")
+                .as_deref(),
+            Some("parameters[2]/animation properties[0]/function/data")
+        );
 
-        let scale_edit = h2_constant_scalar_function_data(5.0, Some(&[1, 0, 0, 0, 0, 0, 240, 64]));
-        assert_eq!(scale_edit.len(), 8);
+        let mut legacy_scale = vec![0; 28];
+        legacy_scale[0] = 1;
+        legacy_scale[4..8].copy_from_slice(&7.5f32.to_le_bytes());
+        let scale_edit = h2_constant_scalar_function_data(5.0, Some(&legacy_scale));
+        assert_eq!(scale_edit.len(), 28);
         assert_eq!(
             f32::from_le_bytes(scale_edit[4..8].try_into().unwrap()),
             5.0
@@ -1302,9 +1342,50 @@ mod tests {
             1.0,
             0.0,
             1.0,
-            Some(&[1, 0x20, 0, 0, 0, 0, 255, 255]),
+            Some(&[
+                1, 0x20, 0, 0, 0, 0, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ]),
         );
-        assert_eq!(color_edit, vec![1, 0x20, 0, 0, 0, 255, 0, 255]);
+        assert_eq!(&color_edit[..8], &[1, 0x20, 0, 0, 0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn h2_shader_template_switch_prunes_unmatched_parameters() {
+        let mut shader = h2_classic_shader_tag();
+        for (index, name) in ["keep_me", "drop_me"].into_iter().enumerate() {
+            apply_one_block_op(
+                &mut shader,
+                &BlockOp {
+                    path: "parameters".to_owned(),
+                    kind: BlockOpKind::Add,
+                },
+            )
+            .unwrap();
+            apply_field_edit(&mut shader, &format!("parameters[{index}]/name"), name).unwrap();
+            apply_field_edit(&mut shader, &format!("parameters[{index}]/type"), "0").unwrap();
+        }
+
+        apply_one_h2_shader_param_op(
+            &mut shader,
+            &H2ShaderParamOp::SwitchTemplate {
+                parameters_block_path: "parameters".to_owned(),
+                allowed_parameter_names: vec!["keep_me".to_owned()],
+            },
+        )
+        .unwrap();
+
+        let parameters = shader
+            .root()
+            .field("parameters")
+            .and_then(|field| field.as_block())
+            .unwrap();
+        assert_eq!(parameters.len(), 1);
+        assert_eq!(
+            parameters
+                .element(0)
+                .and_then(|parameter| parameter.read_string_id("name")),
+            Some("keep_me".to_owned())
+        );
     }
 
     #[test]

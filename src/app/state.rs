@@ -250,6 +250,10 @@ pub(super) enum H2ShaderParamOp {
         field: String,
         input: String,
     },
+    SwitchTemplate {
+        parameters_block_path: String,
+        allowed_parameter_names: Vec<String>,
+    },
 }
 
 /// A deferred structural edit to a block (add/insert/duplicate/delete),

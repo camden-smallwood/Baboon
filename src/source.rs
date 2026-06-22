@@ -12,7 +12,6 @@ use blam_tags::{TagFile, TagLayout, format_group_tag};
 use serde_json;
 use walkdir::WalkDir;
 
-use crate::embedded_definitions;
 use crate::format::TagNameIndex;
 
 #[derive(Clone)]
@@ -346,14 +345,22 @@ fn read_loose_tag(
                 format_group_tag(entry.group_tag)
             )
         })?;
-        let disk_def_path = definitions_root
+        let def_path = definitions_root
             .join(game)
             .join(format!("{group_name}.json"));
-        let def_path = if disk_def_path.is_file() {
-            disk_def_path
-        } else {
-            embedded_definitions::definition_path(game, group_name).unwrap_or(disk_def_path)
-        };
+        if !def_path.is_file() {
+            if !definitions_root.is_dir() {
+                anyhow::bail!(
+                    "{}",
+                    crate::app::definitions_missing_message(definitions_root)
+                );
+            }
+            anyhow::bail!(
+                "no group definition for {} at {}",
+                format_group_tag(entry.group_tag),
+                def_path.display()
+            );
+        }
         let layout = TagLayout::from_json(&def_path)
             .with_context(|| format!("failed to load classic layout {}", def_path.display()))?;
         return read_classic_tag_file(&bytes, layout)

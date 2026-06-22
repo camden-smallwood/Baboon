@@ -67,17 +67,7 @@ mod ui;
 
 #[cfg(test)]
 pub(super) fn test_definition_path(rel: &str) -> PathBuf {
-    if let Some(root) = crate::embedded_definitions::materialized_root() {
-        let embedded = root.join(rel);
-        if embedded.is_file() {
-            return embedded;
-        }
-    }
-    let local = Path::new("definitions").join(rel);
-    if local.is_file() {
-        return local;
-    }
-    local
+    locate_definitions_root().join(rel)
 }
 
 pub struct Baboon {
@@ -165,10 +155,7 @@ impl Baboon {
         let terminal_open_games = load_terminal_open_games();
         set_dark_mode(prefs.dark_mode);
         cc.egui_ctx.set_visuals(foundation_visuals());
-        let mut names = TagNameIndex::load_from_definitions(&locate_definitions_root());
-        // Fill any gaps (or the whole index, if the folder wasn't found) from
-        // the group-name tables baked into the binary.
-        names.merge_missing(TagNameIndex::embedded_fallback());
+        let names = TagNameIndex::load_from_definitions(&locate_definitions_root());
         let (tx, rx) = mpsc::channel();
         Self {
             default_names: names.clone(),
@@ -252,31 +239,37 @@ impl Baboon {
     }
 }
 
-/// Locate the runtime definitions root. A user-provided `definitions/` folder
-/// still wins when present, but standalone builds fall back to the embedded
-/// schemas materialized from bytes baked into the Baboon binary.
+/// Locate the runtime definitions root. The primary runtime contract is:
+/// `definitions/` sits next to `Baboon.exe`.
 pub(super) fn locate_definitions_root() -> PathBuf {
-    for candidate in [PathBuf::from("definitions")] {
-        if candidate.is_dir() {
-            return candidate;
-        }
-    }
+    let mut expected = None;
     if let Ok(exe) = std::env::current_exe() {
-        let mut dir = exe.parent().map(Path::to_path_buf);
-        for _ in 0..4 {
-            let Some(d) = dir else { break };
-            for candidate in [d.join("definitions")] {
-                if candidate.is_dir() {
-                    return candidate;
-                }
+        if let Some(exe_dir) = exe.parent() {
+            let beside_exe = exe_dir.join("definitions");
+            if beside_exe.is_dir() {
+                return beside_exe;
             }
-            dir = d.parent().map(Path::to_path_buf);
+            expected = Some(beside_exe);
         }
     }
-    if let Some(root) = crate::embedded_definitions::materialized_root() {
-        return root;
+    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("definitions");
+    if dev.is_dir() {
+        return dev;
     }
-    PathBuf::from("definitions")
+    let dev_at_manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("definitions");
+    if dev_at_manifest.is_dir() {
+        return dev_at_manifest;
+    }
+    expected.unwrap_or(dev)
+}
+
+pub(crate) fn definitions_missing_message(path: &Path) -> String {
+    format!(
+        "Could not find definitions folder. Expected it at {} — ensure the definitions submodule is initialised with 'git submodule update --init'.",
+        path.display()
+    )
 }
 
 /// Decode an embedded `.ico` into an egui texture for a toolbar button.
@@ -366,20 +359,20 @@ mod tests {
     }
 
     #[test]
-    fn embedded_classic_definitions_load_halo2_shader_layout() {
-        let root = crate::embedded_definitions::materialized_root()
-            .expect("embedded definitions materialized");
-        let schema_path = root.join("halo2_mcc").join("shader.json");
+    fn copied_classic_definitions_load_halo2_shader_layout() {
+        let schema_path = locate_definitions_root()
+            .join("halo2_mcc")
+            .join("shader.json");
         assert!(schema_path.is_file());
-        TagFile::new(&schema_path).expect("embedded halo2 shader schema loads");
-        let names = TagNameIndex::load_game(&root, "halo2_mcc").expect("embedded halo2 meta loads");
+        TagFile::new(&schema_path).expect("copied halo2 shader schema loads");
+        let names = TagNameIndex::load_game(&locate_definitions_root(), "halo2_mcc")
+            .expect("copied halo2 meta loads");
         assert_eq!(names.name_for(u32::from_be_bytes(*b"shad")), Some("shader"));
     }
 
     #[test]
-    fn embedded_definitions_include_all_known_games() {
-        let root = crate::embedded_definitions::materialized_root()
-            .expect("embedded definitions materialized");
+    fn copied_definitions_include_all_known_games() {
+        let root = locate_definitions_root();
         for game in [
             "haloce_mcc",
             "halo2_mcc",
@@ -391,7 +384,7 @@ mod tests {
         ] {
             assert!(
                 root.join(game).join("_meta.json").is_file(),
-                "missing embedded definitions for {game}"
+                "missing copied definitions for {game}"
             );
         }
     }

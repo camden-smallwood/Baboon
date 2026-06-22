@@ -1612,6 +1612,7 @@ fn h2_legacy_function_view(
 ) -> Option<FunctionView> {
     let data_block_path = h2_function_data_path(function_struct, function_path)?;
     let bytes = halo2_function_bytes_from_struct(function_struct)?;
+    let h2_legacy = H2LegacyFunctionView::parse(bytes.clone());
     let function =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| TagFunction::parse(&bytes)))
             .ok()
@@ -1621,16 +1622,22 @@ fn h2_legacy_function_view(
                     .ok()
                     .and_then(|data| TagFunction::parse(&data).ok())
             })?;
-    let mut view = FunctionView::from_function(function).with_h2_scalar_ui();
+    let mut view = if let Some(h2_legacy) = h2_legacy {
+        FunctionView::from_function(function).with_h2_legacy(h2_legacy)
+    } else {
+        FunctionView::from_function(function).with_h2_scalar_ui()
+    };
     view.input_name = animation_property
         .read_string_id("input name")
         .unwrap_or_default();
     view.range_name = animation_property
         .read_string_id("range name")
         .unwrap_or_default();
-    view.output_index = animation_property
-        .read_int_any("type")
-        .and_then(|value| i32::try_from(value).ok());
+    if view.h2_legacy.is_none() {
+        view.output_index = animation_property
+            .read_int_any("type")
+            .and_then(|value| i32::try_from(value).ok());
+    }
     view.time_period_in_seconds = animation_property
         .read_real("time period")
         .or_else(|| animation_property.read_real("time period in seconds"))
@@ -6669,7 +6676,9 @@ fn h2_template_parameter_names_from_reference(
 fn h2_template_parameter_names_from_file(path: &std::path::Path) -> Option<Vec<String>> {
     let bytes = std::fs::read(path).ok()?;
     blam_tags::classic::ClassicHeader::parse(&bytes)?;
-    let schema_path = crate::embedded_definitions::definition_path("halo2_mcc", "shader_template")?;
+    let schema_path = locate_definitions_root()
+        .join("halo2_mcc")
+        .join("shader_template.json");
     let layout = blam_tags::TagLayout::from_json(schema_path).ok()?;
     let tag = blam_tags::classic::read_classic_tag_file(&bytes, layout).ok()?;
     Some(h2_template_parameter_names(tag.root()))

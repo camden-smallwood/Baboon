@@ -43,6 +43,43 @@ pub(super) const OUTPUT_TYPE_OPTIONS: [(i32, &str); 9] = [
     (8, "alpha"),
 ];
 
+pub(super) const H2_OUTPUT_TYPE_OPTIONS: [(u8, &str); 4] = [
+    (0, "scalar (intensity)"),
+    (1, "scalar (alpha)"),
+    (2, "color"),
+    (32, "color"),
+];
+
+pub(super) const H2_FUNCTION_TYPE_OPTIONS: [(u8, &str); 11] = [
+    (0, "identity"),
+    (1, "constant"),
+    (2, "transition"),
+    (3, "periodic"),
+    (4, "linear"),
+    (5, "linear key"),
+    (6, "multi-linear key"),
+    (7, "spline"),
+    (8, "multi-spline"),
+    (9, "exponent"),
+    (10, "spline2"),
+];
+
+pub(super) const H2_EXPONENT_OPTIONS: [(u8, &str); 13] = [
+    (0, "one"),
+    (1, "zero"),
+    (2, "cosine"),
+    (3, "cosine variable"),
+    (4, "diagonal wave"),
+    (5, "diagonal wave variable"),
+    (6, "slide"),
+    (7, "slide variable"),
+    (8, "noise"),
+    (9, "jitter"),
+    (10, "slide"),
+    (11, "wander"),
+    (12, "spark"),
+];
+
 pub(super) const COLOR_GRAPH_OPTIONS: [(ColorGraphType, &str); 5] = [
     (ColorGraphType::Scalar, "scalar"),
     (ColorGraphType::OneColor, "1-color"),
@@ -860,6 +897,7 @@ pub(super) struct FunctionEditPaths {
 #[derive(Clone)]
 pub(super) struct FunctionView {
     pub(super) function: TagFunction,
+    pub(super) h2_legacy: Option<H2LegacyFunctionView>,
     pub(super) input_name: String,
     pub(super) range_name: String,
     /// Output enum index (`RenderMethodAnimatedParameterType`), when the
@@ -874,10 +912,324 @@ pub(super) struct FunctionView {
     pub(super) hide_scalar_color_controls: bool,
 }
 
+fn h2_legacy_combo(
+    ui: &mut Ui,
+    id: &str,
+    value: &mut u8,
+    options: &[(u8, &str)],
+    editable: bool,
+    width: f32,
+) -> bool {
+    let label = options
+        .iter()
+        .find(|(v, _)| v == value)
+        .map(|(_, name)| *name)
+        .unwrap_or("unknown");
+    if !editable {
+        foundation_input_cell(ui, label, width);
+        return false;
+    }
+    let mut changed = false;
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(label)
+        .width(width)
+        .show_ui(ui, |ui| {
+            for (option_value, name) in options {
+                if ui
+                    .selectable_label(*value == *option_value, *name)
+                    .clicked()
+                    && *value != *option_value
+                {
+                    *value = *option_value;
+                    changed = true;
+                }
+            }
+        });
+    changed
+}
+
+pub(super) fn draw_h2_legacy_function_editor_contents(
+    ui: &mut Ui,
+    view: &mut FunctionView,
+    editable: bool,
+) -> bool {
+    let mut changed = false;
+    let Some(h2) = view.h2_legacy.as_mut() else {
+        return false;
+    };
+    let input_editable = editable
+        && view
+            .edit
+            .as_ref()
+            .is_some_and(|paths| !paths.input_name.is_empty());
+    let range_editable = editable
+        && view
+            .edit
+            .as_ref()
+            .is_some_and(|paths| !paths.range_name.is_empty());
+    let time_editable = editable
+        && view
+            .edit
+            .as_ref()
+            .is_some_and(|paths| !paths.time_period.is_empty());
+
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Function type:").color(text_dark()).small());
+        changed |= h2_legacy_combo(
+            ui,
+            "h2_fn_type",
+            &mut h2.function_type,
+            &H2_FUNCTION_TYPE_OPTIONS,
+            editable,
+            130.0,
+        );
+    });
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Input:").color(text_dark()).small());
+        changed |= seeded_name_combo(ui, "h2_fn_input", &mut view.input_name, input_editable);
+
+        let mut ranged = !view.range_name.is_empty();
+        if ui
+            .add_enabled(range_editable, egui::Checkbox::new(&mut ranged, ""))
+            .changed()
+        {
+            if !ranged {
+                view.range_name.clear();
+            }
+            changed = true;
+        }
+        ui.label(RichText::new("Range:").color(text_dark()).small());
+        if ranged {
+            changed |= seeded_name_combo(ui, "h2_fn_range", &mut view.range_name, range_editable);
+        } else {
+            foundation_input_cell(ui, "", 120.0);
+        }
+
+        ui.label(RichText::new("Output Type:").color(text_dark()).small());
+        changed |= h2_legacy_combo(
+            ui,
+            "h2_fn_output",
+            &mut h2.output_type,
+            &H2_OUTPUT_TYPE_OPTIONS,
+            editable,
+            140.0,
+        );
+    });
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Min:").color(text_dark()).small());
+        changed |= ui
+            .add_enabled(editable, egui::DragValue::new(&mut h2.min).speed(1.0))
+            .changed();
+        ui.label(RichText::new("Max:").color(text_dark()).small());
+        changed |= ui
+            .add_enabled(editable, egui::DragValue::new(&mut h2.max).speed(1.0))
+            .changed();
+    });
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Exponent:").color(text_dark()).small());
+        changed |= h2_legacy_combo(
+            ui,
+            "h2_fn_exponent",
+            &mut h2.exponent,
+            &H2_EXPONENT_OPTIONS,
+            editable,
+            150.0,
+        );
+    });
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Frequency:").color(text_dark()).small());
+        changed |= ui
+            .add_enabled(
+                editable,
+                egui::DragValue::new(&mut h2.frequency).speed(0.25),
+            )
+            .changed();
+        ui.label(RichText::new("Phase:").color(text_dark()).small());
+        changed |= ui
+            .add_enabled(editable, egui::DragValue::new(&mut h2.phase).speed(1.0))
+            .changed();
+    });
+    ui.add_space(8.0);
+    draw_h2_legacy_graph_preview(ui, h2);
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("time period").color(text_dark()).small());
+        changed |= ui
+            .add_enabled(
+                time_editable,
+                egui::DragValue::new(&mut view.time_period_in_seconds)
+                    .speed(0.1)
+                    .range(0.0..=f32::MAX),
+            )
+            .changed();
+        ui.label(RichText::new("seconds").color(subtle_dark()).small());
+    });
+    changed
+}
+
+fn draw_h2_legacy_graph_preview(ui: &mut Ui, h2: &H2LegacyFunctionView) {
+    let desired = Vec2::new(360.0, 120.0);
+    let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, Color32::BLACK);
+    let plot = rect.shrink(12.0);
+    painter.rect_filled(plot, 0.0, Color32::from_gray(180));
+    painter.rect_stroke(plot, 0.0, Stroke::new(1.0, Color32::from_gray(80)));
+    for i in 1..10 {
+        let x = egui::lerp(plot.left()..=plot.right(), i as f32 / 10.0);
+        painter.line_segment(
+            [egui::pos2(x, plot.top()), egui::pos2(x, plot.bottom())],
+            Stroke::new(1.0, Color32::from_gray(135)),
+        );
+        let y = egui::lerp(plot.bottom()..=plot.top(), i as f32 / 10.0);
+        painter.line_segment(
+            [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
+            Stroke::new(1.0, Color32::from_gray(135)),
+        );
+    }
+    let low = h2.min.min(h2.max);
+    let high = h2.min.max(h2.max);
+    let span = (high - low).abs().max(0.0001);
+    let mut points = Vec::with_capacity(96);
+    for i in 0..96 {
+        let t = i as f32 / 95.0;
+        let y = ((h2.sample(t) - low) / span).clamp(0.0, 1.0);
+        points.push(egui::pos2(
+            egui::lerp(plot.left()..=plot.right(), t),
+            egui::lerp(plot.bottom()..=plot.top(), y),
+        ));
+    }
+    painter.add(egui::Shape::line(points, Stroke::new(2.0, Color32::GREEN)));
+}
+
+#[derive(Clone, PartialEq)]
+pub(super) struct H2LegacyFunctionView {
+    raw: Vec<u8>,
+    function_type: u8,
+    output_type: u8,
+    exponent: u8,
+    min: f32,
+    max: f32,
+    frequency: f32,
+    phase: f32,
+}
+
+impl H2LegacyFunctionView {
+    pub(super) fn parse(raw: Vec<u8>) -> Option<Self> {
+        if raw.len() < 20 {
+            return None;
+        }
+        let function_type = raw[0];
+        let output_type = raw[1];
+        let min = read_f32_le(&raw, 4).unwrap_or(0.0);
+        let max = read_f32_le(&raw, 8).unwrap_or(1.0);
+        let (exponent, frequency, phase) = if raw.len() >= 52 && function_type == 3 {
+            (
+                raw[32],
+                read_f32_le(&raw, 36).unwrap_or(0.0),
+                read_f32_le(&raw, 40).unwrap_or(0.0),
+            )
+        } else {
+            (
+                raw[2],
+                read_f32_le(&raw, 12).unwrap_or(0.0),
+                read_f32_le(&raw, 16).unwrap_or(0.0),
+            )
+        };
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "H2 legacy function decode: len={} type={} output={} exponent={} freq_bytes={:02x?} freq={} phase_bytes={:02x?} phase={}",
+            raw.len(),
+            function_type,
+            output_type,
+            exponent,
+            if raw.len() >= 52 && function_type == 3 {
+                raw.get(36..40).unwrap_or(&[])
+            } else {
+                raw.get(12..16).unwrap_or(&[])
+            },
+            frequency,
+            if raw.len() >= 52 && function_type == 3 {
+                raw.get(40..44).unwrap_or(&[])
+            } else {
+                raw.get(16..20).unwrap_or(&[])
+            },
+            phase
+        );
+        Some(Self {
+            function_type,
+            output_type,
+            exponent,
+            min,
+            max,
+            frequency,
+            phase,
+            raw,
+        })
+    }
+
+    pub(super) fn to_bytes(&self) -> Vec<u8> {
+        let mut raw = self.raw.clone();
+        if raw.len() < 20 {
+            raw.resize(20, 0);
+        }
+        raw[0] = self.function_type;
+        raw[1] = self.output_type;
+        raw[4..8].copy_from_slice(&self.min.to_le_bytes());
+        raw[8..12].copy_from_slice(&self.max.to_le_bytes());
+        if raw.len() >= 52 && self.function_type == 3 {
+            raw[32] = self.exponent;
+            raw[36..40].copy_from_slice(&self.frequency.to_le_bytes());
+            raw[40..44].copy_from_slice(&self.phase.to_le_bytes());
+        } else {
+            raw[2] = self.exponent;
+            raw[12..16].copy_from_slice(&self.frequency.to_le_bytes());
+            raw[16..20].copy_from_slice(&self.phase.to_le_bytes());
+        }
+        raw
+    }
+
+    fn sample(&self, x: f32) -> f32 {
+        let n = match self.function_type {
+            0 => x,
+            1 => 0.0,
+            3 => h2_periodic_sample(self.exponent, x * self.frequency + self.phase),
+            4 => x,
+            _ => x,
+        }
+        .clamp(0.0, 1.0);
+        self.min + n * (self.max - self.min)
+    }
+}
+
+fn read_f32_le(raw: &[u8], offset: usize) -> Option<f32> {
+    Some(f32::from_le_bytes(
+        raw.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+fn h2_periodic_sample(exponent: u8, x: f32) -> f32 {
+    let t = x.rem_euclid(1.0);
+    match exponent {
+        2 | 3 => (1.0 - (t * std::f32::consts::TAU).cos()) * 0.5,
+        4 | 5 => {
+            if t < 0.5 {
+                t * 2.0
+            } else {
+                (1.0 - t) * 2.0
+            }
+        }
+        _ => t,
+    }
+}
+
 impl FunctionView {
     pub(super) fn from_function(function: TagFunction) -> Self {
         Self {
             function,
+            h2_legacy: None,
             input_name: String::new(),
             range_name: String::new(),
             output_index: None,
@@ -893,6 +1245,7 @@ impl FunctionView {
     ) -> Self {
         Self {
             function,
+            h2_legacy: None,
             input_name: animated.input_name.clone(),
             range_name: animated.range_name.clone(),
             output_index: animated.parameter_type.and_then(|kind| {
@@ -915,6 +1268,19 @@ impl FunctionView {
     pub(super) fn with_h2_scalar_ui(mut self) -> Self {
         self.hide_scalar_color_controls = true;
         self
+    }
+
+    pub(super) fn with_h2_legacy(mut self, h2_legacy: H2LegacyFunctionView) -> Self {
+        self.h2_legacy = Some(h2_legacy);
+        self.hide_scalar_color_controls = true;
+        self
+    }
+
+    pub(super) fn data_bytes(&self) -> Vec<u8> {
+        self.h2_legacy
+            .as_ref()
+            .map(H2LegacyFunctionView::to_bytes)
+            .unwrap_or_else(|| self.function.to_bytes())
     }
 }
 
@@ -962,7 +1328,7 @@ pub(super) struct FunctionSnapshot {
 impl FunctionSnapshot {
     pub(super) fn from_view(view: &FunctionView) -> Self {
         Self {
-            data: view.function.to_bytes(),
+            data: view.data_bytes(),
             output_index: view.output_index,
             input_name: view.input_name.clone(),
             range_name: view.range_name.clone(),
@@ -990,7 +1356,7 @@ pub(super) fn push_function_edit(
 ) -> FunctionEditBatch {
     let mut edits = Vec::new();
     let mut data_ops = Vec::new();
-    let data = view.function.to_bytes();
+    let data = view.data_bytes();
     if data != prev.data {
         match &paths.data {
             FunctionDataStorage::DataField(path) if !path.is_empty() => {
@@ -1078,7 +1444,16 @@ pub(super) fn draw_function_popup(
                         .small(),
                 );
             }
-            draw_function_editor_contents(ui, &mut popup.view, editable, &mut popup.selected_point);
+            if popup.view.h2_legacy.is_some() {
+                draw_h2_legacy_function_editor_contents(ui, &mut popup.view, editable);
+            } else {
+                draw_function_editor_contents(
+                    ui,
+                    &mut popup.view,
+                    editable,
+                    &mut popup.selected_point,
+                );
+            }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

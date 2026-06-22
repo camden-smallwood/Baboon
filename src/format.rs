@@ -66,36 +66,6 @@ impl TagNameIndex {
         Ok(index)
     }
 
-    /// Group→name mappings baked into the binary (the per-game `_meta.json`
-    /// `tag_index` chunks). Used as a fallback so tag-reference resolution works
-    /// even when the on-disk `definitions/` folder can't be located at runtime.
-    ///
-    /// These small meta files are vendored under `src/meta/` (copied from the
-    /// blam-tags definitions) so the binary stays self-contained now that
-    /// blam-tags is an external crate rather than an in-tree submodule. Full
-    /// per-game schemas are also embedded by the build script, while an
-    /// external `definitions/` folder can still override them at runtime.
-    pub fn embedded_fallback() -> Self {
-        const EMBEDDED: &[&str] = &[
-            include_str!("meta/halo3_mcc/_meta.json"),
-            include_str!("meta/halo3odst_mcc/_meta.json"),
-            include_str!("meta/haloreach_mcc/_meta.json"),
-            include_str!("meta/halo4_mcc/_meta.json"),
-            include_str!("meta/halo2amp_mcc/_meta.json"),
-            include_str!("meta/halo2_mcc/_meta.json"),
-            include_str!("meta/haloce_mcc/_meta.json"),
-        ];
-        let mut index = TagNameIndex::default();
-        for json in EMBEDDED {
-            if let Ok(value) = serde_json::from_str::<Value>(json) {
-                if let Ok(game) = Self::from_meta_value(&value) {
-                    index.merge_missing(game);
-                }
-            }
-        }
-        index
-    }
-
     pub fn name_for(&self, group_tag: u32) -> Option<&str> {
         self.name_for_group_tag.get(&group_tag).map(String::as_str)
     }
@@ -301,26 +271,6 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn embedded_fallback_resolves_problem_groups() {
-        // These groups aren't in the library's small hardcoded extension table,
-        // so reference Open relied on the on-disk definitions loading. The
-        // baked-in fallback must cover them so Open works regardless.
-        let index = TagNameIndex::embedded_fallback();
-        assert_eq!(
-            index.name_for(parse_group_tag("udlg").unwrap()),
-            Some("dialogue")
-        );
-        assert_eq!(
-            index.name_for(parse_group_tag("foot").unwrap()),
-            Some("material_effects")
-        );
-        assert_eq!(
-            index.name_for(parse_group_tag("mode").unwrap()),
-            Some("render_model")
-        );
-    }
 
     #[test]
     fn loads_group_names_from_meta_json() {

@@ -32,10 +32,10 @@ kits, detected from the kit's root folder name:
 | Halo 4                   | `H4EK`              | `halo4_mcc`     |
 | Halo 2: Anniversary (MP) | `H2AMPEK` / `H2AEK` | `halo2amp_mcc`  |
 
-Per-game group-name tables (`definitions/<game>/_meta.json`) are provided by
-the definitions submodule and embedded into the binary at compile time, so
-friendly tag-group names and reference resolution work regardless of where the
-executable is launched from.
+Per-game group-name tables and schemas are loaded from
+`definitions/<game>/*.json`. Release builds place the `definitions/` folder next
+to `Baboon.exe`, which keeps the schemas inspectable and editable without
+rebuilding the app.
 
 ---
 
@@ -237,14 +237,15 @@ cargo build --release
 ```
 
 `blam-tags` is fetched automatically by Cargo — you do not need to clone it
-separately. The per-game definition tables under `definitions/` are embedded at
-compile time, so the binary resolves group names and references no matter where
-it is launched from.
+separately. The `definitions/` git submodule is required; initialise it with
+`git submodule update --init` after cloning. The build script copies that
+submodule folder next to the built executable under `target/<profile>/definitions`.
 
 Geometry/animation/import-info extraction additionally relies on the companion
 `blam-tag-shell` binary. The root workspace builds Baboon and `blam-tag-shell`
 together, placing them side by side in `target/debug/` or `target/release/`.
-Ship both `Baboon.exe` and `blam-tag-shell.exe` in releases.
+Ship `Baboon.exe`, `blam-tag-shell.exe`, and the `definitions/` folder in
+releases.
 
 ---
 

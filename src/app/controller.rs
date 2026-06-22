@@ -2289,11 +2289,10 @@ fn selected_tab_after_removal(
 
 pub(super) fn available_definition_games() -> Vec<String> {
     let root = locate_definitions_root();
-    let Ok(entries) = fs::read_dir(root) else {
-        return vec!["halo3_mcc".to_owned()];
-    };
-    let mut games = entries
-        .flatten()
+    let mut games = fs::read_dir(root)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
         .filter_map(|entry| {
             let path = entry.path();
             path.join("_meta.json")
@@ -2312,9 +2311,17 @@ pub(super) fn available_definition_games() -> Vec<String> {
 
 pub(super) fn load_new_tag_groups(game: &str) -> Result<Vec<NewTagGroup>, String> {
     let game_dir = locate_definitions_root().join(game);
+    if !game_dir.parent().is_some_and(|root| root.is_dir()) {
+        return Err(definitions_missing_message(&locate_definitions_root()));
+    }
     let meta_path = game_dir.join("_meta.json");
-    let bytes = fs::read(&meta_path)
-        .map_err(|error| format!("Could not read {}: {error}", meta_path.display()))?;
+    let bytes = fs::read(&meta_path).map_err(|error| {
+        if !locate_definitions_root().is_dir() {
+            definitions_missing_message(&locate_definitions_root())
+        } else {
+            format!("Could not read {}: {error}", meta_path.display())
+        }
+    })?;
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|error| format!("Could not parse {}: {error}", meta_path.display()))?;
     let Some(tag_index) = value.get("tag_index").and_then(Value::as_object) else {
@@ -2328,14 +2335,14 @@ pub(super) fn load_new_tag_groups(game: &str) -> Result<Vec<NewTagGroup>, String
         let Some(group_tag) = parse_group_tag(fourcc) else {
             continue;
         };
-        let schema_path = game_dir.join(format!("{name}.json"));
-        if !schema_path.is_file() {
+        let disk_schema_path = game_dir.join(format!("{name}.json"));
+        if !disk_schema_path.is_file() {
             continue;
         }
         groups.push(NewTagGroup {
             group_tag,
             name: name.to_owned(),
-            schema_path,
+            schema_path: disk_schema_path,
             extension: group_tag_to_extension(group_tag)
                 .unwrap_or(name)
                 .trim()

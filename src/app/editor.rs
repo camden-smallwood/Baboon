@@ -368,7 +368,10 @@ pub(super) fn replace_halo2_function_byte_block(
     block_path: &str,
     data: &[u8],
 ) -> Result<(), String> {
-    if TagFunction::parse(data).is_err() && !is_h2_legacy_constant_function_data(data) {
+    if TagFunction::parse(data).is_err()
+        && !is_h2_legacy_constant_function_data(data)
+        && !is_h2_legacy_editable_function_data(data)
+    {
         return Err("invalid mapping_function data".to_owned());
     }
     let current_len = tag
@@ -394,6 +397,10 @@ pub(super) fn replace_halo2_function_byte_block(
         apply_field_edit(tag, &format!("{block_path}[{index}]/Value"), &value)?;
     }
     Ok(())
+}
+
+fn is_h2_legacy_editable_function_data(data: &[u8]) -> bool {
+    data.len() >= 20 && data.len() != 32 && data.first().is_some_and(|kind| *kind <= 10)
 }
 
 fn replace_halo2_wrapped_function_byte_block(

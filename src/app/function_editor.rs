@@ -1019,13 +1019,9 @@ pub(super) fn draw_h2_legacy_function_editor_contents(
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.label(RichText::new("Min:").color(text_dark()).small());
-        changed |= ui
-            .add_enabled(editable, egui::DragValue::new(&mut h2.min).speed(1.0))
-            .changed();
+        changed |= h2_number_stepper(ui, "h2_min", &mut h2.min, 1.0, editable);
         ui.label(RichText::new("Max:").color(text_dark()).small());
-        changed |= ui
-            .add_enabled(editable, egui::DragValue::new(&mut h2.max).speed(1.0))
-            .changed();
+        changed |= h2_number_stepper(ui, "h2_max", &mut h2.max, 1.0, editable);
     });
     ui.horizontal(|ui| {
         ui.label(RichText::new("Exponent:").color(text_dark()).small());
@@ -1040,16 +1036,9 @@ pub(super) fn draw_h2_legacy_function_editor_contents(
     });
     ui.horizontal(|ui| {
         ui.label(RichText::new("Frequency:").color(text_dark()).small());
-        changed |= ui
-            .add_enabled(
-                editable,
-                egui::DragValue::new(&mut h2.frequency).speed(0.25),
-            )
-            .changed();
+        changed |= h2_number_stepper(ui, "h2_frequency", &mut h2.frequency, 0.25, editable);
         ui.label(RichText::new("Phase:").color(text_dark()).small());
-        changed |= ui
-            .add_enabled(editable, egui::DragValue::new(&mut h2.phase).speed(1.0))
-            .changed();
+        changed |= h2_number_stepper(ui, "h2_phase", &mut h2.phase, 1.0, editable);
     });
     ui.add_space(8.0);
     draw_h2_legacy_graph_preview(ui, h2);
@@ -1065,6 +1054,38 @@ pub(super) fn draw_h2_legacy_function_editor_contents(
             )
             .changed();
         ui.label(RichText::new("seconds").color(subtle_dark()).small());
+    });
+    changed
+}
+
+fn h2_number_stepper(
+    ui: &mut Ui,
+    id: &str,
+    value: &mut f32,
+    step: f32,
+    editable: bool,
+) -> bool {
+    let mut changed = false;
+    ui.push_id(id, |ui| {
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(editable, egui::Button::new(RichText::new("-").small()))
+                .clicked()
+            {
+                *value -= step;
+                changed = true;
+            }
+            changed |= ui
+                .add_enabled(editable, egui::DragValue::new(value).speed(step))
+                .changed();
+            if ui
+                .add_enabled(editable, egui::Button::new(RichText::new("+").small()))
+                .clicked()
+            {
+                *value += step;
+                changed = true;
+            }
+        });
     });
     changed
 }
@@ -1127,9 +1148,9 @@ impl H2LegacyFunctionView {
         let max = read_f32_le(&raw, 8).unwrap_or(1.0);
         let (exponent, frequency, phase) = if raw.len() >= 52 && function_type == 3 {
             (
-                raw[32],
-                read_f32_le(&raw, 36).unwrap_or(0.0),
-                read_f32_le(&raw, 40).unwrap_or(0.0),
+                raw[2],
+                read_f32_le(&raw, 20).unwrap_or(0.0),
+                read_f32_le(&raw, 24).unwrap_or(0.0),
             )
         } else {
             (
@@ -1138,26 +1159,6 @@ impl H2LegacyFunctionView {
                 read_f32_le(&raw, 16).unwrap_or(0.0),
             )
         };
-        #[cfg(debug_assertions)]
-        eprintln!(
-            "H2 legacy function decode: len={} type={} output={} exponent={} freq_bytes={:02x?} freq={} phase_bytes={:02x?} phase={}",
-            raw.len(),
-            function_type,
-            output_type,
-            exponent,
-            if raw.len() >= 52 && function_type == 3 {
-                raw.get(36..40).unwrap_or(&[])
-            } else {
-                raw.get(12..16).unwrap_or(&[])
-            },
-            frequency,
-            if raw.len() >= 52 && function_type == 3 {
-                raw.get(40..44).unwrap_or(&[])
-            } else {
-                raw.get(16..20).unwrap_or(&[])
-            },
-            phase
-        );
         Some(Self {
             function_type,
             output_type,
@@ -1180,9 +1181,9 @@ impl H2LegacyFunctionView {
         raw[4..8].copy_from_slice(&self.min.to_le_bytes());
         raw[8..12].copy_from_slice(&self.max.to_le_bytes());
         if raw.len() >= 52 && self.function_type == 3 {
-            raw[32] = self.exponent;
-            raw[36..40].copy_from_slice(&self.frequency.to_le_bytes());
-            raw[40..44].copy_from_slice(&self.phase.to_le_bytes());
+            raw[2] = self.exponent;
+            raw[20..24].copy_from_slice(&self.frequency.to_le_bytes());
+            raw[24..28].copy_from_slice(&self.phase.to_le_bytes());
         } else {
             raw[2] = self.exponent;
             raw[12..16].copy_from_slice(&self.frequency.to_le_bytes());
@@ -1222,6 +1223,31 @@ fn h2_periodic_sample(exponent: u8, x: f32) -> f32 {
             }
         }
         _ => t,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn h2_legacy_52_byte_periodic_function_reads_frequency_at_offset_20() {
+        let mut raw = vec![0; 52];
+        raw[0] = 3;
+        raw[2] = 6;
+        raw[8..12].copy_from_slice(&1.0f32.to_le_bytes());
+        raw[20..24].copy_from_slice(&0.25f32.to_le_bytes());
+        raw[32..36].copy_from_slice(&1.0f32.to_le_bytes());
+        raw[36..40].copy_from_slice(&1.0f32.to_le_bytes());
+
+        let view = H2LegacyFunctionView::parse(raw).expect("legacy function should parse");
+
+        assert_eq!(view.exponent, 6);
+        assert_eq!(view.min, 0.0);
+        assert_eq!(view.max, 1.0);
+        assert_eq!(view.frequency, 0.25);
+        assert_eq!(view.phase, 0.0);
+        assert_eq!(&view.to_bytes()[20..24], &0.25f32.to_le_bytes());
     }
 }
 

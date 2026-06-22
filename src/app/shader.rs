@@ -89,6 +89,8 @@ pub(super) enum ShaderRowEditKind {
     },
     /// Index-valued dropdown over the given option labels.
     Enum(Vec<String>),
+    /// Bitmask rendered as labelled checkboxes.
+    Flags(Vec<String>),
     /// Animated parameter that is currently a constant function: shows as an
     /// editable float text box. The `ShaderRowEdit.path` is the `function/data`
     /// hex path; `current` is the scalar value as a string. On commit a new
@@ -585,9 +587,86 @@ fn h2_push_direct_field_row(
     if let Some(mut row) = h2_shader_row_from_field(tag_struct, field, &path, "", names) {
         if path_prefix.is_empty() {
             row.label = h2_standard_field_label(field_name).to_owned();
+            h2_apply_standard_field_widget(field_name, &mut row);
         }
         rows.push(row);
     }
+}
+
+fn h2_apply_standard_field_widget(field_name: &str, row: &mut ShaderGridRow) {
+    let Some(edit) = row.edit.as_mut() else {
+        return;
+    };
+    match field_name {
+        "flags" => {
+            edit.kind = ShaderRowEditKind::Flags(vec![
+                "water".to_owned(),
+                "sort first".to_owned(),
+                "no active camo".to_owned(),
+            ]);
+            row.value_cell.text = edit.current.clone();
+            row.parameter_type = Some("flags".to_owned());
+        }
+        "specular type" => {
+            edit.kind = ShaderRowEditKind::Enum(vec![
+                "none".to_owned(),
+                "default shiny".to_owned(),
+                "dull".to_owned(),
+            ]);
+            row.value_cell.text = h2_enum_display_value(&edit.current, &[
+                "none",
+                "default shiny",
+                "dull",
+            ]);
+        }
+        "lightmap type" => {
+            edit.kind = ShaderRowEditKind::Enum(vec![
+                "diffuse".to_owned(),
+                "default specular".to_owned(),
+                "dull specular".to_owned(),
+                "shiny specular".to_owned(),
+            ]);
+            row.value_cell.text = h2_enum_display_value(&edit.current, &[
+                "diffuse",
+                "default specular",
+                "dull specular",
+                "shiny specular",
+            ]);
+        }
+        "shader LOD bias" => {
+            edit.kind = ShaderRowEditKind::Enum(vec![
+                "none".to_owned(),
+                "4x size".to_owned(),
+                "2x size".to_owned(),
+                "1/2 size".to_owned(),
+                "1/4 size".to_owned(),
+                "never".to_owned(),
+                "cinematic".to_owned(),
+                "lowest".to_owned(),
+            ]);
+            row.value_cell.text = h2_enum_display_value(&edit.current, &[
+                "none",
+                "4x size",
+                "2x size",
+                "1/2 size",
+                "1/4 size",
+                "never",
+                "cinematic",
+                "lowest",
+            ]);
+        }
+        _ => {}
+    }
+}
+
+fn h2_enum_display_value(current: &str, options: &[&str]) -> String {
+    current
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .and_then(|index| options.get(index).copied())
+        .unwrap_or(current)
+        .to_owned()
 }
 
 fn h2_standard_field_label(field_name: &str) -> &str {
@@ -2186,7 +2265,17 @@ fn h2_shader_row_from_field(
     let label = h2_nested_label(label_prefix, field.name());
     let formatted = format_value(names, &value, false);
     let color = color_popup_for_value(&label, &value, &formatted);
-    let edit = classic_shader_row_edit(path, &value, &formatted);
+    let edit = classic_shader_row_edit(path, &value, &formatted).or_else(|| {
+        (field.name() == "flags").then(|| ShaderRowEdit {
+            path: path.to_owned(),
+            current: parent.read_int_any(field.name()).unwrap_or_default().to_string(),
+            kind: ShaderRowEditKind::Flags(vec![
+                "water".to_owned(),
+                "sort first".to_owned(),
+                "no active camo".to_owned(),
+            ]),
+        })
+    });
     let value_kind = if is_none_like_value(&formatted) {
         "default"
     } else {
@@ -2518,6 +2607,33 @@ pub(super) fn shader_row_edit_path_and_kind(
 }
 
 #[cfg(test)]
+pub(super) fn shader_row_value_text_for_test(
+    model: &ShaderEditorModel,
+    label: &str,
+) -> Option<String> {
+    model
+        .sections
+        .iter()
+        .flat_map(|section| section.rows.iter())
+        .find(|row| row.label == label)
+        .map(|row| row.value_cell.text.clone())
+}
+
+#[cfg(test)]
+pub(super) fn h2_function_data_range_for_test(data: &[u8]) -> (bool, Option<f32>) {
+    (h2_function_range_enabled(data), h2_function_range_value(data))
+}
+
+#[cfg(test)]
+pub(super) fn h2_function_data_with_range_for_test(
+    data: &[u8],
+    enabled: bool,
+    value: Option<f32>,
+) -> Vec<u8> {
+    h2_function_data_with_range(data, enabled, value)
+}
+
+#[cfg(test)]
 fn shader_row_edit_kind_name(kind: &ShaderRowEditKind) -> &'static str {
     match kind {
         ShaderRowEditKind::Scalar => "scalar",
@@ -2527,6 +2643,7 @@ fn shader_row_edit_kind_name(kind: &ShaderRowEditKind) -> &'static str {
         ShaderRowEditKind::ShaderTemplateRef => "shader_template_ref",
         ShaderRowEditKind::Bool { .. } => "bool",
         ShaderRowEditKind::Enum(_) => "enum",
+        ShaderRowEditKind::Flags(_) => "flags",
         ShaderRowEditKind::FunctionScalar { .. } => "function_scalar",
         ShaderRowEditKind::FunctionColor { .. } => "function_color",
         ShaderRowEditKind::ColorField { .. } => "color",
@@ -5360,15 +5477,16 @@ pub(super) fn draw_shader_grid_row(
     // Orange function rows: range checkbox + "f()" + "×" delete = ~132px.
     // Constant-function scalar rows: "f()" + "×" = ~52px.
     // All other rows: 18px placeholder keeps value_width stable.
+    let has_h2_range = h2_range_control_for_row(row).is_some();
     let function_width = if let Some(function) = row.function.as_ref() {
         if is_h2_function_view(function) {
-            102.0
+            154.0
         } else {
             132.0
         }
     } else if let Some(function) = row.constant_function_view.as_ref() {
         if is_h2_function_view(function) {
-            30.0
+            154.0
         } else {
             52.0
         }
@@ -5376,15 +5494,17 @@ pub(super) fn draw_shader_grid_row(
         row.create_anim_op.as_ref(),
         Some(ShaderContextAction::H2ParameterOp(_))
     ) {
-        34.0
+        if has_h2_range { 154.0 } else { 34.0 }
     } else if row.create_anim_op.is_some() {
         46.0
+    } else if has_h2_range {
+        120.0
     } else {
         18.0
     };
     let value_width =
         (available - indent - label_width - default_width - function_width - 12.0).max(240.0);
-    let height = 25.0;
+    let height = shader_grid_row_height(row);
     let (rect, response) = ui.allocate_exact_size(Vec2::new(available, height), Sense::click());
     ui.painter().rect_filled(rect, 0.0, row.fill);
     ui.painter().line_segment(
@@ -5435,29 +5555,20 @@ pub(super) fn draw_shader_grid_row(
         );
     }
 
+    let mut next_function_x = value_rect.right() + 4.0;
+    if let Some(control) = h2_range_control_for_row(row) {
+        let range_rect = egui::Rect::from_min_size(
+            value_rect.right_top() + Vec2::new(4.0, 2.0),
+            Vec2::new(116.0, height - 4.0),
+        );
+        draw_h2_function_range_control(ui, range_rect, row, &control, edit);
+        next_function_x = range_rect.right() + 4.0;
+    }
+
     if let Some(function) = row.function.as_ref() {
         // Orange function row: range: checkbox + f() button + × delete button.
-        let range_rect = egui::Rect::from_min_size(
-            value_rect.right_top() + Vec2::new(8.0, 2.0),
-            Vec2::new(64.0, height - 8.0),
-        );
-        let check_rect = egui::Rect::from_min_size(
-            range_rect.left_top() + Vec2::new(0.0, 2.0),
-            Vec2::splat(14.0),
-        );
-        ui.painter().rect_filled(check_rect, 0.0, material_input());
-        ui.painter()
-            .rect_stroke(check_rect, 0.0, Stroke::new(1.0, material_input_edge()));
-        ui.painter().text(
-            check_rect.right_center() + Vec2::new(4.0, 0.0),
-            Align2::LEFT_CENTER,
-            "range:",
-            FontId::proportional(12.0),
-            material_text(),
-        );
-
         let button_rect = egui::Rect::from_min_size(
-            range_rect.right_top() + Vec2::new(4.0, -1.0),
+            egui::pos2(next_function_x, value_rect.top() + 1.0),
             Vec2::new(28.0, height - 4.0),
         );
         ui.painter().rect_filled(button_rect, 0.0, material_input());
@@ -5523,7 +5634,7 @@ pub(super) fn draw_shader_grid_row(
     } else if let Some(func_view) = row.constant_function_view.as_ref() {
         // Constant-function scalar row: small "f()" to open graph + "×" delete.
         let f_rect = egui::Rect::from_min_size(
-            value_rect.right_top() + Vec2::new(4.0, 2.0),
+            egui::pos2(next_function_x, value_rect.top() + 2.0),
             Vec2::new(26.0, height - 4.0),
         );
         ui.painter().rect_filled(f_rect, 0.0, material_input());
@@ -5660,6 +5771,257 @@ fn shader_function_button_text(function: &FunctionView) -> &'static str {
     }
 }
 
+fn shader_grid_row_height(row: &ShaderGridRow) -> f32 {
+    if row
+        .edit
+        .as_ref()
+        .is_some_and(|edit| matches!(edit.kind, ShaderRowEditKind::Flags(_)))
+    {
+        58.0
+    } else {
+        25.0
+    }
+}
+
+#[derive(Clone)]
+enum H2RangeControl {
+    Existing { block_path: String, data: Vec<u8> },
+    Create { op: H2ShaderParamOp, data: Vec<u8> },
+}
+
+fn h2_range_control_for_row(row: &ShaderGridRow) -> Option<H2RangeControl> {
+    if let Some(function) = row.function.as_ref().filter(|function| is_h2_function_view(function)) {
+        return h2_range_control_from_function(function);
+    }
+    if let Some(function) = row
+        .constant_function_view
+        .as_ref()
+        .filter(|function| is_h2_function_view(function))
+    {
+        return h2_range_control_from_function(function);
+    }
+    if let Some(edit) = row.edit.as_ref() {
+        match &edit.kind {
+            ShaderRowEditKind::H2FunctionScalar {
+                block_path,
+                legacy_data,
+            }
+            | ShaderRowEditKind::H2FunctionColor {
+                block_path,
+                legacy_data,
+            } => {
+                let data = legacy_data
+                    .clone()
+                    .or_else(|| {
+                        row.constant_function_view
+                            .as_ref()
+                            .map(FunctionView::data_bytes)
+                    })
+                    .unwrap_or_default();
+                if !data.is_empty() {
+                    return Some(H2RangeControl::Existing {
+                        block_path: block_path.clone(),
+                        data,
+                    });
+                }
+            }
+            ShaderRowEditKind::H2CreateFunctionScalar { create_op }
+            | ShaderRowEditKind::H2CreateFunctionColor { create_op } => {
+                if let Some(data) = h2_initial_function_data_from_op(create_op) {
+                    return Some(H2RangeControl::Create {
+                        op: create_op.clone(),
+                        data,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(ShaderContextAction::H2ParameterOp(op)) = row.create_anim_op.as_ref() {
+        if let Some(data) = h2_initial_function_data_from_op(op) {
+            return Some(H2RangeControl::Create {
+                op: op.clone(),
+                data,
+            });
+        }
+    }
+    None
+}
+
+fn h2_range_control_from_function(function: &FunctionView) -> Option<H2RangeControl> {
+    let edit = function.edit.as_ref()?;
+    let FunctionDataStorage::Halo2ByteBlock(block_path) = &edit.data else {
+        return None;
+    };
+    Some(H2RangeControl::Existing {
+        block_path: block_path.clone(),
+        data: function.data_bytes(),
+    })
+}
+
+fn h2_initial_function_data_from_op(op: &H2ShaderParamOp) -> Option<Vec<u8>> {
+    match op {
+        H2ShaderParamOp::EnsureAnimationProperty {
+            initial_function_data,
+            ..
+        } => Some(initial_function_data.clone()),
+        _ => None,
+    }
+}
+
+fn h2_function_range_enabled(data: &[u8]) -> bool {
+    data.get(1)
+        .copied()
+        .is_some_and(|flags| flags & FunctionFlags::RANGE != 0)
+}
+
+fn h2_function_range_value(data: &[u8]) -> Option<f32> {
+    Some(f32::from_le_bytes(data.get(8..12)?.try_into().ok()?))
+}
+
+fn h2_function_data_with_range(data: &[u8], enabled: bool, value: Option<f32>) -> Vec<u8> {
+    let mut next = data.to_vec();
+    if next.len() < 12 {
+        next.resize(12, 0);
+    }
+    if enabled {
+        next[1] |= FunctionFlags::RANGE;
+    } else {
+        next[1] &= !FunctionFlags::RANGE;
+    }
+    if let Some(value) = value {
+        next[8..12].copy_from_slice(&value.to_le_bytes());
+    }
+    next
+}
+
+fn h2_push_range_data_edit(edit: &mut FieldEditContext<'_>, control: &H2RangeControl, data: Vec<u8>) {
+    match control {
+        H2RangeControl::Existing { block_path, .. } => {
+            edit.h2_shader_param_ops.push(H2ShaderParamOp::EditFunctionData {
+                block_path: block_path.clone(),
+                data,
+            });
+        }
+        H2RangeControl::Create { op, .. } => {
+            let mut op = op.clone();
+            if let H2ShaderParamOp::EnsureAnimationProperty {
+                initial_function_data,
+                ..
+            } = &mut op
+            {
+                *initial_function_data = data;
+                edit.h2_shader_param_ops.push(op);
+            }
+        }
+    }
+}
+
+fn draw_h2_function_range_control(
+    ui: &mut Ui,
+    rect: egui::Rect,
+    row: &ShaderGridRow,
+    control: &H2RangeControl,
+    edit: &mut FieldEditContext<'_>,
+) {
+    let data = match control {
+        H2RangeControl::Existing { data, .. } | H2RangeControl::Create { data, .. } => data,
+    };
+    if data.len() < 12 {
+        return;
+    }
+    let enabled = h2_function_range_enabled(data);
+    let mut checked = enabled;
+    let check_rect = egui::Rect::from_min_size(rect.left_top() + Vec2::new(0.0, 2.0), Vec2::splat(14.0));
+    let response = ui
+        .scope_builder(egui::UiBuilder::new().max_rect(check_rect), |ui| {
+            ui.add_enabled(edit.editable, egui::Checkbox::new(&mut checked, ""))
+        })
+        .inner;
+    ui.painter().text(
+        check_rect.right_center() + Vec2::new(4.0, 0.0),
+        Align2::LEFT_CENTER,
+        "range:",
+        FontId::proportional(12.0),
+        material_text(),
+    );
+    if response.changed() {
+        h2_push_range_data_edit(
+            edit,
+            control,
+            h2_function_data_with_range(data, checked, h2_function_range_value(data)),
+        );
+    }
+
+    let value_rect = egui::Rect::from_min_size(
+        rect.left_top() + Vec2::new(66.0, 0.0),
+        Vec2::new((rect.width() - 66.0).max(42.0), rect.height()),
+    );
+    let current = if enabled {
+        h2_function_range_value(data)
+            .map(format_shader_float)
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let id = edit.widget_id(("h2_range", row.label.as_str()));
+    let buffer_key = format!("{}|h2_range:{}", edit.tag_key, row.label);
+    let buffer = edit
+        .buffers
+        .entry(buffer_key)
+        .or_insert_with(|| current.clone());
+    if !ui.memory(|m| m.has_focus(id)) && *buffer != current {
+        *buffer = current.clone();
+    }
+    let mut commit_value = None;
+    ui.scope_builder(egui::UiBuilder::new().max_rect(value_rect), |ui| {
+        ui.visuals_mut().extreme_bg_color = material_input();
+        let resp = ui.add_enabled(
+            edit.editable && enabled,
+            egui::TextEdit::singleline(buffer)
+                .id(id)
+                .desired_width(value_rect.width())
+                .text_color(material_text())
+                .font(egui::TextStyle::Monospace),
+        );
+        text_edit_cursor_to_start_on_tab_focus(ui, &resp);
+        if resp.lost_focus()
+            && enabled
+            && buffer.trim() != current.trim()
+            && let Ok(value) = buffer.trim().parse::<f32>()
+        {
+            commit_value = Some(value);
+        }
+    });
+    if let Some(value) = commit_value {
+        h2_push_range_data_edit(
+            edit,
+            control,
+            h2_function_data_with_range(data, true, Some(value)),
+        );
+    }
+}
+
+fn draw_h2_value_prefixed_text_edit(
+    ui: &mut Ui,
+    id: egui::Id,
+    buffer: &mut String,
+    width: f32,
+) -> egui::Response {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        ui.label(RichText::new("value:").color(material_text()).monospace());
+        ui.add(
+            egui::TextEdit::singleline(buffer)
+                .id(id)
+                .desired_width((width - 42.0).max(40.0))
+                .text_color(material_text())
+                .font(egui::TextStyle::Monospace),
+        )
+    })
+    .inner
+}
+
 /// Render an editable widget inside a shader grid value cell and push a
 /// `PendingFieldEdit` on commit. The leaf field type drives parsing in
 /// `apply_field_edit`, so scalars/ints/refs all just emit the text.
@@ -5703,6 +6065,34 @@ pub(super) fn draw_shader_editable_value(
                     input: i.to_string(),
                 });
             }
+        }
+
+        ShaderRowEditKind::Flags(options) => {
+            let current_mask = row_edit.current.trim().parse::<u64>().unwrap_or(0);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for (bit, option) in options.iter().enumerate() {
+                        let mut checked = current_mask & (1u64 << bit) != 0;
+                        let response = ui.add_enabled(
+                            edit.editable,
+                            egui::Checkbox::new(&mut checked, option.as_str()),
+                        );
+                        if response.changed() {
+                            let mut next_mask = current_mask;
+                            if checked {
+                                next_mask |= 1u64 << bit;
+                            } else {
+                                next_mask &= !(1u64 << bit);
+                            }
+                            edit.pending.push(PendingFieldEdit {
+                                path: row_edit.path.clone(),
+                                input: next_mask.to_string(),
+                            });
+                        }
+                    }
+                });
+            });
         }
 
         // Constant animated-parameter scalar: text box + × delete button.
@@ -6354,13 +6744,7 @@ pub(super) fn draw_shader_editable_value(
             let mut commit_val: Option<f32> = None;
             ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                 ui.visuals_mut().extreme_bg_color = material_input();
-                let resp = ui.add(
-                    egui::TextEdit::singleline(buffer)
-                        .id(id)
-                        .desired_width(rect.width())
-                        .text_color(material_text())
-                        .font(egui::TextStyle::Monospace),
-                );
+                let resp = draw_h2_value_prefixed_text_edit(ui, id, buffer, rect.width());
                 text_edit_cursor_to_start_on_tab_focus(ui, &resp);
                 if resp.lost_focus() && buffer.trim() != current.trim() {
                     if let Ok(v) = buffer.trim().parse::<f32>() {
@@ -6391,13 +6775,7 @@ pub(super) fn draw_shader_editable_value(
             let mut commit_val: Option<f32> = None;
             ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                 ui.visuals_mut().extreme_bg_color = material_pending_input();
-                let resp = ui.add(
-                    egui::TextEdit::singleline(buffer)
-                        .id(id)
-                        .desired_width(rect.width())
-                        .text_color(material_text())
-                        .font(egui::TextStyle::Monospace),
-                );
+                let resp = draw_h2_value_prefixed_text_edit(ui, id, buffer, rect.width());
                 text_edit_cursor_to_start_on_tab_focus(ui, &resp);
                 if resp.lost_focus() && buffer.trim() != current.trim() {
                     if let Ok(v) = buffer.trim().parse::<f32>() {
@@ -6487,13 +6865,7 @@ pub(super) fn draw_shader_editable_value(
             let mut commit = None;
             ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                 ui.visuals_mut().extreme_bg_color = material_pending_input();
-                let resp = ui.add(
-                    egui::TextEdit::singleline(buffer)
-                        .id(id)
-                        .desired_width(rect.width())
-                        .text_color(material_text())
-                        .font(egui::TextStyle::Monospace),
-                );
+                let resp = draw_h2_value_prefixed_text_edit(ui, id, buffer, rect.width());
                 text_edit_cursor_to_start_on_tab_focus(ui, &resp);
                 if resp.lost_focus() && buffer.trim() != current.trim() {
                     commit = Some(buffer.trim().to_owned());

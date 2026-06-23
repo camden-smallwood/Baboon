@@ -1720,7 +1720,7 @@ pub(super) fn draw_foundation_tag_reference_row(
             )
             .clicked()
         {
-            *buffer = "NONE".to_owned();
+            buffer.clear();
             edit.pending.push(PendingFieldEdit {
                 path: path.to_owned(),
                 input: "NONE".to_owned(),

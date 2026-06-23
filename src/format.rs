@@ -214,12 +214,14 @@ fn write_string_id(out: &mut String, s: &StringIdData) {
 
 fn write_tag_reference(index: &TagNameIndex, out: &mut String, r: &TagReferenceData) {
     use std::fmt::Write;
-    let Some((group_tag, path)) = &r.group_tag_and_name else {
-        out.push_str("NONE");
+    let Some((group_tag, raw_path)) = &r.group_tag_and_name else {
         return;
     };
     // On-disk paths are null-terminated; drop the trailing NUL for display.
-    let path = path.trim_end_matches('\u{0}');
+    let path = raw_path.trim_end_matches('\u{0}');
+    if path.trim().is_empty() {
+        return;
+    }
     match index.name_for(*group_tag) {
         Some(name) => write!(out, "{path}.{name}").unwrap(),
         None => write!(out, "{}:{path}", format_group_tag(*group_tag)).unwrap(),
@@ -298,6 +300,31 @@ mod tests {
         assert_eq!(
             group_label(&index, u32::from_be_bytes(*b"bipd")),
             "bipd (biped)"
+        );
+    }
+
+    #[test]
+    fn empty_tag_references_format_blank() {
+        let index = TagNameIndex::default();
+        assert_eq!(
+            format_value(
+                &index,
+                &TagFieldData::TagReference(TagReferenceData {
+                    group_tag_and_name: None
+                }),
+                false
+            ),
+            ""
+        );
+        assert_eq!(
+            format_value(
+                &index,
+                &TagFieldData::TagReference(TagReferenceData {
+                    group_tag_and_name: Some((u32::from_be_bytes(*b"bitm"), "\0".to_owned()))
+                }),
+                false
+            ),
+            ""
         );
     }
 }

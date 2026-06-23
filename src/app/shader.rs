@@ -5474,36 +5474,8 @@ pub(super) fn draw_shader_grid_row(
     let indent = depth as f32 * 10.0;
     let label_width = (230.0_f32 - indent).max(150.0);
     let default_width = 110.0;
-    // Orange function rows: range checkbox + "f()" + "×" delete = ~132px.
-    // Constant-function scalar rows: "f()" + "×" = ~52px.
-    // All other rows: 18px placeholder keeps value_width stable.
     let has_h2_range = h2_range_control_for_row(row).is_some();
-    let function_width = if let Some(function) = row.function.as_ref() {
-        if is_h2_function_view(function) {
-            154.0
-        } else {
-            132.0
-        }
-    } else if let Some(function) = row.constant_function_view.as_ref() {
-        if is_h2_function_view(function) {
-            154.0
-        } else {
-            52.0
-        }
-    } else if matches!(
-        row.create_anim_op.as_ref(),
-        Some(ShaderContextAction::H2ParameterOp(_))
-    ) {
-        if has_h2_range { 154.0 } else { 34.0 }
-    } else if row.create_anim_op.is_some() {
-        46.0
-    } else if has_h2_range {
-        120.0
-    } else {
-        18.0
-    };
-    let value_width =
-        (available - indent - label_width - default_width - function_width - 12.0).max(240.0);
+    let right_controls_width = shader_right_controls_width(row, has_h2_range);
     let height = shader_grid_row_height(row);
     let (rect, response) = ui.allocate_exact_size(Vec2::new(available, height), Sense::click());
     ui.painter().rect_filled(rect, 0.0, row.fill);
@@ -5536,9 +5508,12 @@ pub(super) fn draw_shader_grid_row(
         color_popup,
     );
 
-    let value_rect = egui::Rect::from_min_size(
-        default_rect.right_top() + Vec2::new(6.0, 0.0),
-        Vec2::new(value_width, height - 4.0),
+    let value_left = default_rect.right() + 6.0;
+    let controls_left = rect.right() - right_controls_width;
+    let value_right = (controls_left - 4.0).max(value_left + 40.0);
+    let value_rect = egui::Rect::from_min_max(
+        egui::pos2(value_left, default_rect.top()),
+        egui::pos2(value_right, default_rect.bottom()),
     );
 
     // Editable value cell when the row carries an edit path and the tag is
@@ -5555,11 +5530,11 @@ pub(super) fn draw_shader_grid_row(
         );
     }
 
-    let mut next_function_x = value_rect.right() + 4.0;
+    let mut next_function_x = controls_left.max(value_rect.right() + 4.0);
     if let Some(control) = h2_range_control_for_row(row) {
         let range_rect = egui::Rect::from_min_size(
-            value_rect.right_top() + Vec2::new(4.0, 2.0),
-            Vec2::new(116.0, height - 4.0),
+            egui::pos2(next_function_x, value_rect.top() + 2.0),
+            Vec2::new(H2_RANGE_CONTROL_WIDTH, height - 4.0),
         );
         draw_h2_function_range_control(ui, range_rect, row, &control, edit);
         next_function_x = range_rect.right() + 4.0;
@@ -5707,7 +5682,7 @@ pub(super) fn draw_shader_grid_row(
     } else if let (true, Some(action)) = (editable, row.create_anim_op.as_ref()) {
         // No animated parameter yet — show an "f()+" button to create one.
         let button_rect = egui::Rect::from_min_size(
-            value_rect.right_top() + Vec2::new(12.0, 2.0),
+            egui::pos2(next_function_x, value_rect.top() + 2.0),
             Vec2::new(34.0, height - 4.0),
         );
         ui.painter().rect_filled(button_rect, 0.0, material_input());
@@ -5781,6 +5756,29 @@ fn shader_grid_row_height(row: &ShaderGridRow) -> f32 {
     } else {
         25.0
     }
+}
+
+const H2_RANGE_CONTROL_WIDTH: f32 = 136.0;
+
+fn shader_right_controls_width(row: &ShaderGridRow, has_h2_range: bool) -> f32 {
+    let mut width = 8.0;
+    if has_h2_range {
+        width += H2_RANGE_CONTROL_WIDTH + 4.0;
+    }
+    if let Some(function) = row.function.as_ref() {
+        width += 28.0;
+        if !is_h2_function_view(function) {
+            width += 22.0;
+        }
+    } else if let Some(function) = row.constant_function_view.as_ref() {
+        width += 26.0;
+        if !is_h2_function_view(function) {
+            width += 20.0;
+        }
+    } else if row.create_anim_op.is_some() {
+        width += 34.0;
+    }
+    width
 }
 
 #[derive(Clone)]

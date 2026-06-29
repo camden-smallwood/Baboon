@@ -20,7 +20,13 @@ impl Baboon {
                         Err(error) => format!("Update check failed: {error}"),
                     };
                 }
-                WorkerMessage::SourceLoaded(Ok(mut loaded)) => {
+                WorkerMessage::SourceLoaded {
+                    result: Ok(mut loaded),
+                    recent_path,
+                } => {
+                    if let Some(path) = recent_path {
+                        self.remember_recent_folder(path);
+                    }
                     // Set terminal work dir to the game kit root (parent of tags/).
                     self.terminal_work_dir =
                         if let TagSource::LooseFolder { root, .. } = &loaded.source {
@@ -60,7 +66,9 @@ impl Baboon {
                     // New entry universe — invalidate any cached search results.
                     self.source_generation = self.source_generation.wrapping_add(1);
                 }
-                WorkerMessage::SourceLoaded(Err(error)) => {
+                WorkerMessage::SourceLoaded {
+                    result: Err(error), ..
+                } => {
                     self.status = error;
                 }
                 WorkerMessage::TagLoaded { key, result } => {
@@ -225,7 +233,10 @@ impl Baboon {
         self.status = format!("Loading {}", path.display());
         thread::spawn(move || {
             let result = load_single_file(path, &names).map_err(|e| e.to_string());
-            let _ = tx.send(WorkerMessage::SourceLoaded(result));
+            let _ = tx.send(WorkerMessage::SourceLoaded {
+                result,
+                recent_path: None,
+            });
             ctx.request_repaint();
         });
     }
@@ -237,6 +248,10 @@ impl Baboon {
         else {
             return;
         };
+        self.begin_load_folder_path(path, ctx);
+    }
+
+    pub(super) fn begin_load_folder_path(&mut self, path: PathBuf, ctx: egui::Context) {
         let tx = self.tx.clone();
         let names = self.default_names.clone();
         let definitions_root = locate_definitions_root();
@@ -252,10 +267,14 @@ impl Baboon {
             Some(game) => format!("Indexing {} as {game}", folder_info.scan_root.display()),
             None => format!("Indexing {}", folder_info.scan_root.display()),
         };
+        let recent_path = clean_recent_path(path.clone());
         thread::spawn(move || {
             let result = load_folder(path, &names, &definitions_root, &ek_folder_aliases)
                 .map_err(|e| e.to_string());
-            let _ = tx.send(WorkerMessage::SourceLoaded(result));
+            let _ = tx.send(WorkerMessage::SourceLoaded {
+                result,
+                recent_path: Some(recent_path),
+            });
             ctx.request_repaint();
         });
     }
@@ -268,14 +287,48 @@ impl Baboon {
         else {
             return;
         };
+        self.begin_load_monolithic_path(path, ctx);
+    }
+
+    pub(super) fn begin_load_monolithic_path(&mut self, path: PathBuf, ctx: egui::Context) {
         let tx = self.tx.clone();
         let names = self.default_names.clone();
         self.status = format!("Opening {}", path.display());
+        let recent_path = clean_recent_path(path.clone());
         thread::spawn(move || {
             let result = load_monolithic_blob_index(path, &names).map_err(|e| e.to_string());
-            let _ = tx.send(WorkerMessage::SourceLoaded(result));
+            let _ = tx.send(WorkerMessage::SourceLoaded {
+                result,
+                recent_path: Some(recent_path),
+            });
             ctx.request_repaint();
         });
+    }
+
+    pub(super) fn load_recent_folder(&mut self, path: PathBuf, ctx: egui::Context) {
+        if !path.exists() {
+            self.status = format!("Folder not found: {}", path.display());
+            self.remove_recent_folder(&path);
+            return;
+        }
+        if path.is_dir() {
+            self.begin_load_folder_path(path, ctx);
+        } else {
+            self.begin_load_monolithic_path(path, ctx);
+        }
+    }
+
+    pub(super) fn remember_recent_folder(&mut self, path: PathBuf) {
+        let path = clean_recent_path(path);
+        self.recent_folders
+            .retain(|existing| !same_recent_path(existing, &path));
+        self.recent_folders.insert(0, path);
+        self.recent_folders.truncate(MAX_RECENT_FOLDERS);
+    }
+
+    pub(super) fn remove_recent_folder(&mut self, path: &Path) {
+        self.recent_folders
+            .retain(|existing| !same_recent_path(existing, path));
     }
 
     pub(super) fn open_new_tag_dialog(&mut self) {
@@ -1452,6 +1505,7 @@ impl Baboon {
             tool_commands_window_size: Some(self.tool_commands_window_size),
             tool_commands_left_width: self.tool_commands_left_width,
             tool_commands_collapsed_categories: self.tool_commands_collapsed_categories.clone(),
+            recent_folders: self.recent_folders.clone(),
         }
     }
 

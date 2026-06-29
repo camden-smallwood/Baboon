@@ -1,7 +1,10 @@
 use super::*;
 
 pub(super) enum WorkerMessage {
-    SourceLoaded(Result<LoadedSourceData, String>),
+    SourceLoaded {
+        result: Result<LoadedSourceData, String>,
+        recent_path: Option<PathBuf>,
+    },
     TagLoaded {
         key: String,
         result: Result<TagFile, String>,
@@ -173,6 +176,7 @@ pub(super) struct GuiPrefs {
     pub(super) tool_commands_window_size: Option<Vec2>,
     pub(super) tool_commands_left_width: f32,
     pub(super) tool_commands_collapsed_categories: HashSet<String>,
+    pub(super) recent_folders: Vec<PathBuf>,
 }
 
 pub(super) struct TagDocument {
@@ -536,6 +540,7 @@ impl Default for GuiPrefs {
             tool_commands_window_size: None,
             tool_commands_left_width: DEFAULT_TOOL_COMMANDS_LEFT_WIDTH,
             tool_commands_collapsed_categories: HashSet::new(),
+            recent_folders: Vec::new(),
         }
     }
 }
@@ -552,6 +557,7 @@ pub(super) const DEFAULT_TOOL_COMMANDS_WINDOW_SIZE: Vec2 = Vec2::new(800.0, 600.
 pub(super) const MIN_TOOL_COMMANDS_WINDOW_SIZE: Vec2 = Vec2::new(600.0, 400.0);
 pub(super) const DEFAULT_TOOL_COMMANDS_LEFT_WIDTH: f32 = 280.0;
 pub(super) const MIN_TOOL_COMMANDS_LEFT_WIDTH: f32 = 200.0;
+pub(super) const MAX_RECENT_FOLDERS: usize = 10;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum BitmapPanelTab {

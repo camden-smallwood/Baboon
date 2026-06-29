@@ -127,6 +127,7 @@ pub struct Baboon {
     tool_commands_window_size: Vec2,
     tool_commands_left_width: f32,
     tool_commands_collapsed_categories: HashSet<String>,
+    recent_folders: Vec<PathBuf>,
     blender_path: Option<PathBuf>,
     blender_path_input: String,
     color_popup: Option<MaterialColorPopup>,
@@ -220,6 +221,7 @@ impl Baboon {
                 .tool_commands_left_width
                 .max(MIN_TOOL_COMMANDS_LEFT_WIDTH),
             tool_commands_collapsed_categories: prefs.tool_commands_collapsed_categories.clone(),
+            recent_folders: prefs.recent_folders.clone(),
             blender_path_input: prefs
                 .blender_path
                 .as_ref()

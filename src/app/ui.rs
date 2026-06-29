@@ -1231,6 +1231,25 @@ impl eframe::App for Baboon {
                             ui.close_menu();
                             self.begin_load_folder(ctx.clone());
                         }
+                        ui.menu_button("Recent Folders", |ui| {
+                            if self.recent_folders.is_empty() {
+                                ui.add_enabled(false, egui::Button::new("No recent folders"));
+                            } else {
+                                for path in self.recent_folders.clone() {
+                                    let full_path = path.display().to_string();
+                                    let label = recent_folder_menu_label(&path);
+                                    if ui.button(label).on_hover_text(full_path).clicked() {
+                                        ui.close_menu();
+                                        self.load_recent_folder(path, ctx.clone());
+                                    }
+                                }
+                                ui.separator();
+                                if ui.button("Clear Recent Folders").clicked() {
+                                    self.recent_folders.clear();
+                                    ui.close_menu();
+                                }
+                            }
+                        });
                         if ui.button("Load Monolithic blob_index.dat...").clicked() {
                             ui.close_menu();
                             self.begin_load_monolithic(ctx.clone());
@@ -2214,4 +2233,23 @@ impl eframe::App for Baboon {
         self.process_pending_open(ctx);
         self.process_pending_tool_import(ctx);
     }
+}
+
+fn recent_folder_menu_label(path: &Path) -> String {
+    const MAX_CHARS: usize = 54;
+    let text = path.display().to_string();
+    let count = text.chars().count();
+    if count <= MAX_CHARS {
+        return text;
+    }
+    let keep = MAX_CHARS.saturating_sub(3);
+    let tail = text
+        .chars()
+        .rev()
+        .take(keep)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("...{tail}")
 }

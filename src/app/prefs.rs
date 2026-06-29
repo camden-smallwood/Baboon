@@ -92,6 +92,7 @@ pub(super) fn load_gui_prefs() -> GuiPrefs {
             &value,
             "tool_commands_collapsed_categories",
         ),
+        recent_folders: load_path_list(&value, "recent_folders"),
     }
 }
 
@@ -126,6 +127,49 @@ fn load_string_set(value: &Value, key: &str) -> HashSet<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn load_path_list(value: &Value, key: &str) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if let Some(items) = value.get(key).and_then(Value::as_array) {
+        for item in items {
+            let Some(path) = item.as_str().map(str::trim).filter(|path| !path.is_empty()) else {
+                continue;
+            };
+            let path = clean_recent_path(PathBuf::from(path));
+            if !paths
+                .iter()
+                .any(|existing| same_recent_path(existing, &path))
+            {
+                paths.push(path);
+            }
+            if paths.len() >= MAX_RECENT_FOLDERS {
+                break;
+            }
+        }
+    }
+    paths
+}
+
+pub(super) fn clean_recent_path(path: PathBuf) -> PathBuf {
+    let text = path.display().to_string();
+    #[cfg(windows)]
+    let text = text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned();
+    #[cfg(not(windows))]
+    let text = text;
+    PathBuf::from(text)
+}
+
+pub(super) fn same_recent_path(a: &Path, b: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        a.to_string_lossy()
+            .eq_ignore_ascii_case(&b.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
 }
 
 fn load_ek_folder_aliases(value: &Value) -> Vec<EkFolderAlias> {
@@ -188,6 +232,7 @@ pub(super) fn save_gui_prefs(
         "tool_commands_window_size": prefs.tool_commands_window_size.map(|size| vec![size.x, size.y]),
         "tool_commands_left_width": prefs.tool_commands_left_width,
         "tool_commands_collapsed_categories": collapsed_tool_categories,
+        "recent_folders": prefs.recent_folders.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
         "terminal_open_games": games,
     });
     let text = serde_json::to_string_pretty(&value)

@@ -8,8 +8,9 @@ the **Halo: The Master Chief Collection** editing kits — no round-trip through
 the official tools required.
 
 Open a single tag, an entire editing-kit `tags/` folder, or a monolithic tag
-cache; browse and search the tag tree; edit fields, blocks, shaders, and
-functions inline; preview bitmaps; and extract geometry, textures, and
+cache; browse and search the tag tree (by name *or* field value); edit fields,
+blocks, shaders, and functions inline with full undo/redo; preview bitmaps and
+3D models; trace references and diff tags; and extract geometry, textures, and
 animations — all from one application.
 
 > Baboon is the GUI front end for the `blam-tags` project. The library does the
@@ -31,6 +32,10 @@ kits, detected from the kit's root folder name:
 | Halo: Reach              | `HREK`              | `haloreach_mcc` |
 | Halo 4                   | `H4EK`              | `halo4_mcc`     |
 | Halo 2: Anniversary (MP) | `H2AMPEK` / `H2AEK` | `halo2amp_mcc`  |
+
+The game is also detected from a folder literally named after the game id (e.g.
+`halo3_mcc`), and **custom editing-kit folder names** can be mapped to a game in
+*File → Settings* for non-standard layouts.
 
 Per-game group-name tables and schemas are loaded from
 `definitions/<game>/*.json`. Release builds place the `definitions/` folder next
@@ -60,24 +65,50 @@ silently skipped.
 
 ### Tag browser
 
-- **Folder view** — the on-disk directory hierarchy.
+- **Folder view** — the on-disk directory hierarchy, with a **per-group icon**
+  beside each tag (and on its editor tab) for quick visual scanning.
 - **Groups view** — tags regrouped by tag group (e.g. *biped*, *weapon*,
   *render_model*), with friendly names resolved from the definition tables.
-- **Search/filter** — a fast, memoised substring filter that prunes the tree to
-  matching tags and their ancestors. Results are cached and recomputed only when
-  the query, source, or mode actually changes — not per frame — so it stays
-  responsive across 100k+ entry kits.
+- **Recent folders** — a quick-open list of recently opened tag folders.
+- **Boolean search/filter** — a fast, memoised filter supporting space-separated
+  **AND**, `|` **OR**, and `^prefix` / `suffix$` / `^exact$` anchors matched over
+  the filename, group four-CC, and group name. A label flags degenerate filters
+  (an empty `|` operand, an anchor-only term). Results are cached and recomputed
+  only when the query, source, or mode changes — not per frame — so the tree
+  stays responsive across 100k+ entry kits.
+- **Sort** — order each folder/group by natural, name, or type.
+- **Reveal in tree** — jump the browser to any tag (e.g. from a search result),
+  force-opening its ancestors and scrolling it into view.
 - **Background indexing** — a full recursive scan runs in the background to power
   Groups view and global search without expanding every node first. The
   completed index is **persisted** (per game, to `%APPDATA%\Baboon`) so
   subsequent launches skip the scan entirely.
 - **Context actions** — per-tag and per-folder right-click actions for JSON dump,
-  raw extraction, bitmap/geometry/animation extraction, and *Open in File
+  raw extraction, bitmap/geometry/animation extraction, *Rename / Move* (with
+  automatic reference fix-up across every referencing tag), and *Open in File
   Explorer*.
+
+### Search, navigation & cross-referencing
+
+- **Field-value search** — search across tags' *field values* (not just names),
+  run on a background worker against an in-memory field index and optionally
+  scoped to a tag group; results open in a clickable window.
+- **Find references** — list every tag that references the current tag.
+- **Content Explorer** — a reference-graph navigator centred on one tag: who
+  references it (parents) and what it references (children), with back/forward
+  history and a filter box.
+- **Unreferenced tags** — scan for tags that nothing else points at.
+- **Keyword tagging** — attach freeform keywords to tags (stored in a per-game
+  sidecar, outside the tags) and browse or filter by them.
+- **Scenario map IDs** — list scenario map IDs across the kit.
+- **Tag Diff** — compare the current tag field-by-field against another open tab
+  *or* any tag on disk; differences (changed values and block element-count
+  mismatches) show in a table and export as TSV.
 
 ### Tabbed, dockable editor
 
-- Open multiple tags as **tabs** in a rack.
+- Open multiple tags as **tabs** in a rack, each with its group icon and an
+  amber tint + ● marker when it has unsaved edits.
 - **Tear off** any tab into a floating, resizable window — and drag it back onto
   the rack (or click *dock*) to re-dock it.
 - An LRU cache bounds how many parsed tags and tabs are kept in memory at once,
@@ -91,26 +122,40 @@ pageable resources — with inline editing for loose little-endian tags:
 - Scalars, integers, reals, strings, and `string_id`s.
 - **Enums** and **bit flags** with named options.
 - **Colors** via an interactive color-picker popup with channel parsing.
-- **Tag references** with an *Open* button that resolves and opens the referenced
-  tag in a new tab — even if it isn't in the current index — plus an *Import*
-  button on geometry references that re-imports the source asset via `tool`.
+- **Tag references** with an *Open* button (Alt-click opens in a floating window)
+  that resolves and opens the referenced tag — even if it isn't in the current
+  index — an *Import* button on geometry references that re-imports the source
+  asset via `tool`, **drag-and-drop** from the browser to set a reference, and a
+  red highlight when a referenced tag is missing on disk.
+- **Block-index fields** render as a dropdown of the target block's elements
+  (with a leading `<none>`) plus a "go to" button to the referenced element.
+- **Field documentation** — help text, units, and value ranges (recovered from
+  the JSON schemas, since shipped tags strip them) shown on hover, plus Foundation-
+  style **explanation blocks** inline.
+- **Undo / redo** — every edit (field, block, structural) is journaled;
+  `Ctrl+Z` / `Ctrl+Y` and the Edit menu step through the history.
 - **Guerilla-style "Search fields"** — type a block or field name to collapse the
   editor down to just the matching node(s) and their ancestors.
 - **Expert mode** toggle to reveal advanced/normally-hidden fields.
 - Monolithic-cache and big-endian tags are opened **read-only**; only
   little-endian loose tags can be saved back to disk.
 
-### Block editing
+### Block & array editing
 
 Full structural editing of tag blocks, applied safely after each frame's render
 pass:
 
 - **Add**, **insert**, **duplicate**, and **delete** elements, plus **delete
-  all** (with a confirmation modal for destructive ops).
+  all** (with a confirmation modal for destructive ops). Fixed-size **arrays**
+  omit the count-changing actions but support copy and in-place replace.
 - **Copy / paste** elements — including the entire block — between two open tags
   of the same group, with compatibility re-validated by the library before
   insertion.
 - **Replace** a selected element or an entire block from the clipboard.
+- **Copy block as TSV** / **Paste TSV** — round-trip a block's leaf fields
+  through tab-separated rows (e.g. via a spreadsheet).
+- **Breadcrumb / jump-to-parent** — a `↑` control on nested blocks scrolls back
+  to the parent block, with the path shown on hover.
 
 ### Shader & material editor
 
@@ -121,6 +166,12 @@ For `shader`, `material`, and `material_shader` tags, Baboon builds a
   caching them across tags.
 - Shows bitmap, scalar, integer, color, and category parameters with their
   defaults, all editable inline.
+- **Inline bitmap thumbnails** on bitmap-reference rows, with an enlarged
+  preview on hover (works for classic Halo 1/2 bitmaps too).
+- **Differs-from-default** indicator (an accent bar on changed rows) and a
+  right-click **Reset to default**.
+- **Resizable** label column (drag the divider) and the full parameter name +
+  type shown on hover.
 - Add optional **animated parameters** (e.g. bitmap transforms) from a context
   menu, and edit their animation **functions**.
 
@@ -137,9 +188,39 @@ hex-blob round-trip channel that preserves arbitrary function data losslessly.
 For `bitmap` tags, a built-in texture viewer:
 
 - Decodes the bitmap to RGBA (via `blam-tags`' bitmap decoder).
+- **Image (sequence) and mip-level selectors** — step through every image in a
+  multi-image bitmap and every mipmap level (the dimensions update accordingly).
 - Per-channel **R / G / B / A** toggles, including alpha-only inspection.
-- **Zoom-to-cursor** and **drag-to-pan**, with fit-on-open.
-- Reports format, type, dimensions, and image count for multi-image bitmaps.
+- **Zoom-to-cursor**, **drag-to-pan**, zoom presets (25–400 % / fit), and a
+  background-colour toggle behind transparent images.
+- Under-cursor **pixel coordinate + RGBA readout**.
+- Reports format, type, dimensions, and image count.
+
+### Model preview
+
+For `model` (`hlmt`) and `render_model` (`mode`) tags, a real-time 3D preview:
+
+- Renders the model with orbit/pan/zoom camera controls.
+- **Variant selector** — switch between the model's named variants and see the
+  per-region permutation set applied; region/permutation choices can be tweaked
+  and synced back to the variant.
+- **Marker overlay** with a name filter, and a loading indicator while geometry
+  resolves.
+- Edit `render_model` **marker fields and names** inline.
+
+### Cross-game tag overviews
+
+Curated summary panels for tags that are otherwise tedious as raw field dumps,
+resolving the layout differences across kits:
+
+- **material_effects**, **dialogue**, and **sound_classes** overview tables, with
+  clickable references that jump to the related tags.
+
+### Custom color palettes
+
+Save colours picked in the color editor and build reusable Baboon palettes that
+can be loaded back in any tag — handy for keeping shader/material colours
+consistent.
 
 ### Export & extraction
 
@@ -171,7 +252,7 @@ All extraction runs on background threads and reports progress to the status bar
 - An integrated **terminal panel** runs commands in the editing-kit root with
   live streamed output. Its open/closed state is remembered **per editing kit**.
 
-### Tool launchers
+### Tool launchers & command runner
 
 Toolbar buttons launch the loaded kit's tools, with the executable auto-detected
 per game:
@@ -184,9 +265,15 @@ per game:
 
 Launchers are disabled until the relevant executable is found in the kit.
 
+A **Run Tool Command** window lists each game's `tool` commands (from per-game
+JSON), with a form for their parameters — enum dropdowns, file/path pickers, and
+**inline validation** that flags empty required parameters before running. The
+assembled command runs in the integrated terminal.
+
 ### Preferences
 
 Browser mode, prefix display, expert mode, dark/light theme, the Blender path,
+custom editing-kit folder names, recent folders, keyword and palette sidecars,
 and per-kit terminal state are persisted to `%APPDATA%\Baboon` and restored on
 launch.
 
@@ -210,8 +297,9 @@ launch.
   console; the app icon is embedded as a Win32 resource via `build.rs`).
   *Open in File Explorer* and the bundled tool launchers are Windows-specific;
   the core editor is platform-neutral.
-- **Dependencies** — `eframe`, `image` (icon/bitmap handling), `rfd` (dialogs),
-  `walkdir` (folder scanning), `serde_json` (JSON dump & index/prefs), `anyhow`.
+- **Dependencies** — `eframe`, `egui_extras` (SVG tag icons), `image`
+  (icon/bitmap handling), `flate2`, `rfd` (dialogs), `walkdir` (folder scanning),
+  `serde_json` (JSON dump & index/prefs), `anyhow`.
 
 ---
 

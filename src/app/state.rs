@@ -24,6 +24,26 @@ pub(super) enum WorkerMessage {
     TerminalDone,
     // GitHub latest-release lookup finished.
     UpdateCheckFinished(Result<UpdateCheckResult, String>),
+    // Background field-value search finished. Carries the source generation it
+    // ran against so stale results (after a reload) can be discarded.
+    FieldValueSearchFinished {
+        generation: u64,
+        query: String,
+        result: Result<Vec<FieldValueMatch>, String>,
+    },
+    // Background field-value index build finished. `blobs` is (entry key,
+    // lowercased searchable text) pairs; `generation` guards against staleness.
+    FieldIndexBuilt {
+        generation: u64,
+        blobs: Vec<(String, String)>,
+    },
+}
+
+/// One tag whose field values matched a field-value search, with the first
+/// matching `field path = value` to show as an annotation.
+pub(super) struct FieldValueMatch {
+    pub(super) entry: TagEntry,
+    pub(super) label: String,
 }
 
 pub(super) struct FolderRefactorProgress {
@@ -82,12 +102,105 @@ pub(super) enum BrowserAction {
     ExtractMaterialShaderSourceFolder(Vec<String>),
     ExtractHlslIncludeSource(String),
     ExtractHlslIncludeFolder(Vec<String>),
+    FindReferences(String),
+    ExploreReferences(String),
+    RenameTag(String),
+}
+
+/// The "Rename / Move tag (fix references)" dialog. Shows the referrers that
+/// will be rewritten (preview) and an editable destination path; applying moves
+/// the file on disk and rewrites every referencing tag.
+pub(super) struct RenameTagState {
+    pub(super) key: String,
+    pub(super) group_tag: u32,
+    /// Current display path (forward slashes, with extension) — shown read-only.
+    pub(super) old_display: String,
+    /// File extension (kept fixed; the group can't change on rename).
+    pub(super) extension: String,
+    /// Editable destination: relative path, forward slashes, NO extension.
+    pub(super) new_path_input: String,
+    /// Display paths of tags that reference this one and will be updated.
+    pub(super) referrers: Vec<String>,
+    /// True when no reverse-dependency index was available to list referrers.
+    pub(super) referrers_unavailable: bool,
+}
+
+/// Results of a tag query (find-references / unreferenced), shown in a floating
+/// results window. Each entry is clickable to open the tag.
+pub(super) struct TagQueryResults {
+    pub(super) title: String,
+    pub(super) entries: Vec<TagEntry>,
+    /// Optional per-entry annotation (parallel to `entries`), e.g. the map id.
+    /// Empty when there are no annotations.
+    pub(super) annotations: Vec<String>,
+    /// Optional explanatory note (e.g. when the reference index is unavailable).
+    pub(super) note: Option<String>,
+}
+
+/// Drag-and-drop payload carried when dragging a tag from the browser onto a
+/// tag-reference cell. `input` is the ready-to-apply reference string
+/// (`"fourcc:back\\slash\\path"`); `group_tag` lets a drop target validate it.
+#[derive(Clone)]
+pub(super) struct DraggedTagRef {
+    pub(super) group_tag: u32,
+    /// Foundation reference-cell form: `"fourcc:back\\slash\\path"` (no ext).
+    pub(super) input: String,
+    /// Shader bitmap-row form: forward-slash relative path, no extension.
+    pub(super) rel_path: String,
+    pub(super) label: String,
+}
+
+/// A one-shot "reveal in browser tree" request: force-open the folder nodes in
+/// `ancestors` (root→parent labels) and scroll the entry `key` into view.
+/// Consumed (taken) during the browser draw.
+pub(super) struct RevealRequest {
+    pub(super) key: String,
+    pub(super) ancestors: Vec<String>,
+}
+
+/// Reference-graph navigator centered on one tag: who references it (parents)
+/// and what it references (children). Navigating to a parent/child re-centers
+/// and records back/forward history.
+pub(super) struct ContentExplorer {
+    pub(super) focus: TagEntry,
+    pub(super) parents: Vec<TagEntry>,
+    pub(super) children: Vec<TagEntry>,
+    /// Substring filter applied to both the parents and children lists.
+    pub(super) filter: String,
+    /// True when no reverse-dependency index was available to build the view.
+    pub(super) index_unavailable: bool,
+    pub(super) back: Vec<TagEntry>,
+    pub(super) forward: Vec<TagEntry>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum BrowserMode {
     Folders,
     Groups,
+}
+
+/// Ordering of tags within a browser folder/group node.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum BrowserSort {
+    /// Filesystem / natural order (as built).
+    Natural,
+    /// By filename, A→Z.
+    Name,
+    /// By group (type), then filename.
+    Type,
+}
+
+impl BrowserSort {
+    pub(super) const ALL: [BrowserSort; 3] =
+        [BrowserSort::Natural, BrowserSort::Name, BrowserSort::Type];
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            BrowserSort::Natural => "Natural",
+            BrowserSort::Name => "Name",
+            BrowserSort::Type => "Type",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -163,6 +276,7 @@ impl FilterCache {
 #[derive(Clone, PartialEq)]
 pub(super) struct GuiPrefs {
     pub(super) browser_mode: BrowserMode,
+    pub(super) browser_sort: BrowserSort,
     pub(super) show_browser_prefixes: bool,
     pub(super) double_click_to_open_tags: bool,
     pub(super) show_block_sizes: bool,
@@ -171,6 +285,8 @@ pub(super) struct GuiPrefs {
     pub(super) ui_scale: f32,
     pub(super) model_preview_size: f32,
     pub(super) blender_path: Option<PathBuf>,
+    /// Field search: passive (highlight matches) vs active (collapse to matches).
+    pub(super) field_search_passive: bool,
     pub(super) ek_folder_aliases: Vec<EkFolderAlias>,
     pub(super) tool_commands_window_pos: Option<egui::Pos2>,
     pub(super) tool_commands_window_size: Option<Vec2>,
@@ -182,11 +298,16 @@ pub(super) struct GuiPrefs {
 pub(super) struct TagDocument {
     pub(super) tag: TagFile,
     pub(super) dirty: bool,
+    pub(super) journal: EditJournal,
 }
 
 impl TagDocument {
     pub(super) fn clean(tag: TagFile) -> Self {
-        Self { tag, dirty: false }
+        Self {
+            tag,
+            dirty: false,
+            journal: EditJournal::default(),
+        }
     }
 }
 
@@ -327,6 +448,9 @@ pub(super) struct BlockConfirm {
 pub(super) struct OpenTagRequest {
     pub(super) group_tag: u32,
     pub(super) rel_path: String,
+    /// When true, open the tag in a floating (torn-off) window instead of the
+    /// docked tab rack. Set by Alt-clicking a reference's Open button.
+    pub(super) float: bool,
 }
 
 /// A request to (re)import a geometry tag via `tool` (from the Import button on
@@ -416,6 +540,10 @@ pub(super) struct BlockHeaderActions {
     pub(super) copy: bool,
     /// Right-click → "Copy entire block".
     pub(super) copy_block: bool,
+    /// Right-click → "Copy block as TSV" (plaintext, Excel-friendly).
+    pub(super) copy_block_tsv: bool,
+    /// Right-click → "Paste TSV…" (open the import window for this block).
+    pub(super) paste_tsv: bool,
     /// Right-click → "Paste" (insert clipboard element(s) after the selection).
     pub(super) paste: bool,
     /// Right-click → "Replace selected element" with the clipboard.
@@ -424,11 +552,34 @@ pub(super) struct BlockHeaderActions {
     pub(super) replace_block: bool,
 }
 
+/// Emitted by a block header when the user picks "Paste TSV…" — the app hoists
+/// it into `tsv_paste` and opens the import window.
+pub(super) struct TsvPasteRequest {
+    pub(super) block_path: String,
+    pub(super) block_label: String,
+    pub(super) element_count: usize,
+}
+
+/// The open TSV-import window: the user pastes tab-separated rows and applies
+/// them to the target block's existing elements (per-cell, via `apply_field_edit`).
+pub(super) struct TsvPasteState {
+    pub(super) tag_key: String,
+    pub(super) block_path: String,
+    pub(super) block_label: String,
+    pub(super) element_count: usize,
+    pub(super) text: String,
+    pub(super) status: Option<String>,
+}
+
 pub(super) struct FieldEditContext<'a> {
     pub(super) view_scope: &'a str,
     pub(super) tag_key: &'a str,
     /// Group tag of the tag being rendered — gates block paste compatibility.
     pub(super) group_tag: u32,
+    /// Root struct of the tag being rendered — used to resolve block-index
+    /// fields whose target block is an ancestor (not a sibling). `None` in
+    /// read-only/secondary contexts where ancestor resolution isn't needed.
+    pub(super) root: Option<blam_tags::TagStruct<'a>>,
     pub(super) game: Option<&'a str>,
     pub(super) definitions_root: Option<&'a Path>,
     pub(super) definition_group_name: Option<&'a str>,
@@ -463,6 +614,13 @@ pub(super) struct FieldEditContext<'a> {
     /// `self.function_popup` after rendering so the shared popup handler can
     /// show the graph editor and apply function-data edits.
     pub(super) function_request: &'a mut Option<FunctionPopup>,
+    /// Documentation overlay (help/units + explanation blocks) for this tag's
+    /// group, parsed from the JSON definition. Used to restore field tooltips
+    /// and explanation rows that shipped tags strip from their layout.
+    pub(super) docs: Option<&'a DefDocs>,
+    /// Set when the user picks "Paste TSV…" on a block; the caller hoists it
+    /// into `self.tsv_paste` to open the import window.
+    pub(super) tsv_paste_request: &'a mut Option<TsvPasteRequest>,
     /// The current block clipboard (read), for gating "Paste" in block menus.
     pub(super) block_clipboard: Option<&'a BlockClipboard>,
     /// Set when the user clicks "Copy element"; the caller hoists it into
@@ -492,9 +650,28 @@ impl FieldEditContext<'_> {
                 let canon = strip_node_indices(node_path);
                 // The implicit root group has no path — always keep it visible
                 // so the matched nodes inside it can be reached.
-                Some(canon.is_empty() || filter.open_paths.contains(&canon))
+                if canon.is_empty() || filter.open_paths.contains(&canon) {
+                    Some(true)
+                } else if filter.passive {
+                    // Passive (highlight) mode: open matches' ancestors but leave
+                    // everything else as the user left it — never force-collapse.
+                    None
+                } else {
+                    // Active mode: collapse everything that isn't on a match path.
+                    Some(false)
+                }
             }
         }
+    }
+
+    /// Whether `path`'s field should be highlighted as a search match. Only true
+    /// in passive (highlight) mode for fields whose own name matched the query.
+    pub(super) fn field_highlighted(&self, path: &str) -> bool {
+        matches!(
+            self.field_filter,
+            Some(FieldFilterAction::Apply(filter)) if filter.passive
+                && filter.highlight_paths.contains(&strip_node_indices(path))
+        )
     }
 }
 
@@ -512,12 +689,21 @@ pub(super) enum FieldFilterAction {
 /// independent of which block element happens to be selected.
 pub(super) struct FieldFilter {
     pub(super) open_paths: std::collections::HashSet<String>,
+    /// Canonical paths of fields whose own name matched the query — tinted in
+    /// passive (highlight) mode. Empty/unused in active (collapse) mode.
+    pub(super) highlight_paths: std::collections::HashSet<String>,
+    /// Passive = highlight matches without collapsing the rest; active = collapse
+    /// to matches (the original behaviour).
+    pub(super) passive: bool,
 }
 
 #[derive(Clone)]
 pub(super) struct FieldDisplayMeta {
     pub(super) label: String,
     pub(super) unit: Option<String>,
+    /// A `[min,max]` range/bounds hint (shown after the unit/type), e.g.
+    /// `[0,+inf]`. Parsed out of the unit slot or the bare name.
+    pub(super) range: Option<String>,
     pub(super) help: Option<String>,
     pub(super) read_only: bool,
     pub(super) advanced: bool,
@@ -527,6 +713,7 @@ impl Default for GuiPrefs {
     fn default() -> Self {
         Self {
             browser_mode: BrowserMode::Folders,
+            browser_sort: BrowserSort::Natural,
             show_browser_prefixes: false,
             double_click_to_open_tags: false,
             show_block_sizes: false,
@@ -535,6 +722,7 @@ impl Default for GuiPrefs {
             ui_scale: DEFAULT_UI_SCALE,
             model_preview_size: DEFAULT_MODEL_PREVIEW_SIZE,
             blender_path: None,
+            field_search_passive: false,
             ek_folder_aliases: Vec::new(),
             tool_commands_window_pos: None,
             tool_commands_window_size: None,
@@ -571,6 +759,38 @@ impl Default for BitmapPanelTab {
     }
 }
 
+/// Background fill behind the bitmap preview image. Helps judge alpha edges
+/// against light/dark/saturated backdrops.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum BitmapPreviewBg {
+    DarkGray,
+    Black,
+    White,
+    Magenta,
+}
+
+impl BitmapPreviewBg {
+    pub(super) const ALL: [Self; 4] = [Self::DarkGray, Self::Black, Self::White, Self::Magenta];
+
+    pub(super) fn color(self) -> egui::Color32 {
+        match self {
+            Self::DarkGray => egui::Color32::from_rgb(64, 64, 64),
+            Self::Black => egui::Color32::BLACK,
+            Self::White => egui::Color32::WHITE,
+            Self::Magenta => egui::Color32::from_rgb(255, 0, 255),
+        }
+    }
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::DarkGray => "Dark gray",
+            Self::Black => "Black",
+            Self::White => "White",
+            Self::Magenta => "Magenta",
+        }
+    }
+}
+
 pub(super) struct BitmapPreviewState {
     pub(super) active_tab: BitmapPanelTab,
     pub(super) show_red: bool,
@@ -586,6 +806,11 @@ pub(super) struct BitmapPreviewState {
     pub(super) pan: Vec2,
     /// False until zoom is initialized to fit the image on first decode.
     pub(super) zoom_initialized: bool,
+    /// Background fill behind the previewed image.
+    pub(super) bg: BitmapPreviewBg,
+    /// Selected image (sequence) index and mipmap level being previewed.
+    pub(super) image_index: usize,
+    pub(super) mip_index: usize,
 }
 
 impl Default for BitmapPreviewState {
@@ -602,6 +827,9 @@ impl Default for BitmapPreviewState {
             zoom: 1.0,
             pan: Vec2::ZERO,
             zoom_initialized: false,
+            bg: BitmapPreviewBg::DarkGray,
+            image_index: 0,
+            mip_index: 0,
         }
     }
 }
@@ -610,9 +838,36 @@ pub(super) struct BitmapPreviewData {
     pub(super) width: u32,
     pub(super) height: u32,
     pub(super) image_count: usize,
+    /// Mipmap level count of the currently-decoded image (≥ 1).
+    pub(super) mip_count: usize,
     pub(super) format_name: String,
     pub(super) type_name: String,
     pub(super) rgba: Vec<u8>,
+}
+
+/// One differing leaf field between two compared tags (Tag Diff).
+pub(super) struct TagFieldDiff {
+    pub(super) path: String,
+    pub(super) a: String,
+    pub(super) b: String,
+}
+
+/// State for the "Compare Tags" window: tag A (fixed to the launch tag), the
+/// chosen tag B, and the computed diff (once "Compare" is clicked).
+pub(super) struct TagDiffState {
+    pub(super) a_key: String,
+    /// Open-tab key of tag B (when B is an open tag); `None` when B was picked
+    /// from disk (then `results`/`b_display` are set directly).
+    pub(super) b_key: Option<String>,
+    /// Display label for tag B (open key or picked disk path).
+    pub(super) b_display: Option<String>,
+    pub(super) results: Option<TagDiffResults>,
+}
+
+pub(super) struct TagDiffResults {
+    pub(super) diffs: Vec<TagFieldDiff>,
+    /// True when the diff hit the cap and more differences exist.
+    pub(super) truncated: bool,
 }
 
 pub(super) struct ModelPreviewState {
@@ -625,6 +880,9 @@ pub(super) struct ModelPreviewState {
     pub(super) region_selections: HashMap<String, ModelRegionSelection>,
     pub(super) projected_triangles: Vec<ModelProjectedTriangle>,
     pub(super) show_markers: bool,
+    /// Case-insensitive substring filter on marker names (empty = show all).
+    /// Only applied while `show_markers` is on.
+    pub(super) marker_filter: String,
     pub(super) show_wireframe: bool,
     pub(super) show_backfaces: bool,
     pub(super) scale: f32,
@@ -645,6 +903,7 @@ impl Default for ModelPreviewState {
             region_selections: HashMap::new(),
             projected_triangles: Vec::new(),
             show_markers: false,
+            marker_filter: String::new(),
             show_wireframe: false,
             show_backfaces: false,
             scale: 1.0,
@@ -661,7 +920,7 @@ pub(super) enum ModelTagPanelTab {
     RenderModel,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(super) struct ModelRegionSelection {
     pub(super) enabled: bool,
     pub(super) permutation: String,
@@ -679,8 +938,14 @@ pub(super) struct ModelPreviewData {
 #[derive(Clone)]
 pub(super) struct ModelVariantPreview {
     pub(super) name: String,
+    /// Region name → resolved permutation (own perm or parent-inherited).
     pub(super) regions: HashMap<String, String>,
-    pub(super) has_explicit_regions: bool,
+    /// Region names the variant's block LISTS at all — including ones listed with
+    /// an empty permutation (which means "explicitly removed", e.g. spec-ops elite
+    /// has no helmet). A region NOT in this set is simply uncustomised and falls
+    /// back to its base permutation (e.g. major elite helmet → base), rather than
+    /// being hidden. Distinguishes "removed" from "not customised".
+    pub(super) listed_regions: std::collections::HashSet<String>,
 }
 
 #[derive(Clone, Copy)]

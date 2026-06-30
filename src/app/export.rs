@@ -505,11 +505,17 @@ fn sanitize_shader_path_segment(segment: &str) -> String {
 mod material_shader_source_tests {
     use super::*;
 
+    /// Build an expected relative path from components, so the comparison uses
+    /// the native separator on any platform (the function joins via `PathBuf`).
+    fn rel(parts: &[&str]) -> PathBuf {
+        parts.iter().collect()
+    }
+
     #[test]
     fn material_shader_source_path_strips_data_and_adds_fx() {
         assert_eq!(
             material_shader_source_relative_path(r"data\shaders\material_shaders\decals\base", 0),
-            PathBuf::from(r"shaders\material_shaders\decals\base.fx")
+            rel(&["shaders", "material_shaders", "decals", "base.fx"])
         );
     }
 
@@ -520,7 +526,7 @@ mod material_shader_source_tests {
                 r"data\shaders\material_shaders\include\core\lighting.hlsli",
                 1
             ),
-            PathBuf::from(r"shaders\material_shaders\include\core\lighting.hlsli")
+            rel(&["shaders", "material_shaders", "include", "core", "lighting.hlsli"])
         );
     }
 
@@ -528,7 +534,7 @@ mod material_shader_source_tests {
     fn material_shader_source_path_cannot_escape_output_folder() {
         assert_eq!(
             material_shader_source_relative_path(r"C:\data\..\shaders\bad:name\base", 2),
-            PathBuf::from(r"shaders\bad_name\base.fx")
+            rel(&["shaders", "bad_name", "base.fx"])
         );
     }
 
@@ -536,7 +542,7 @@ mod material_shader_source_tests {
     fn hlsl_include_source_path_preserves_hlsl_extension() {
         assert_eq!(
             hlsl_include_source_relative_path(r"rasterizer\hlsl\ssao.hlsl"),
-            PathBuf::from(r"rasterizer\hlsl\ssao.hlsl")
+            rel(&["rasterizer", "hlsl", "ssao.hlsl"])
         );
     }
 
@@ -544,7 +550,7 @@ mod material_shader_source_tests {
     fn hlsl_include_source_path_replaces_friendly_tag_extension() {
         assert_eq!(
             hlsl_include_source_relative_path(r"rasterizer\hlsl\ssao.hlsl_include"),
-            PathBuf::from(r"rasterizer\hlsl\ssao.hlsl")
+            rel(&["rasterizer", "hlsl", "ssao.hlsl"])
         );
     }
 
@@ -552,7 +558,7 @@ mod material_shader_source_tests {
     fn hlsl_include_source_path_adds_hlsl_extension() {
         assert_eq!(
             hlsl_include_source_relative_path(r"rasterizer\hlsl\ssao"),
-            PathBuf::from(r"rasterizer\hlsl\ssao.hlsl")
+            rel(&["rasterizer", "hlsl", "ssao.hlsl"])
         );
     }
 }

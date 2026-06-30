@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::process::Command;
 
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -43,6 +44,14 @@ mod style;
 use style::*;
 mod state;
 use state::*;
+mod journal;
+use journal::*;
+mod keywords;
+use keywords::*;
+mod field_index;
+use field_index::*;
+mod field_docs;
+use field_docs::*;
 mod prefs;
 use prefs::*;
 mod browser;
@@ -104,10 +113,12 @@ pub struct Baboon {
     /// so [`filter_cache`] knows to recompute against fresh data.
     source_generation: u64,
     browser_mode: BrowserMode,
+    browser_sort: BrowserSort,
     show_browser_prefixes: bool,
     double_click_to_open_tags: bool,
     show_block_sizes: bool,
     expert_mode: bool,
+    field_search_passive: bool,
     dark_mode: bool,
     ui_scale: f32,
     pending_ui_scale: f32,
@@ -132,6 +143,24 @@ pub struct Baboon {
     blender_path_input: String,
     color_popup: Option<MaterialColorPopup>,
     function_popup: Option<FunctionPopup>,
+    query_results: Option<TagQueryResults>,
+    /// "Compare Tags" (Tag Diff) window state.
+    tag_diff: Option<TagDiffState>,
+    content_explorer: Option<ContentExplorer>,
+    keywords: KeywordStore,
+    keyword_input: String,
+    keyword_chooser_open: bool,
+    reveal_target: Option<RevealRequest>,
+    field_value_search_open: bool,
+    field_value_query: String,
+    field_value_group: String,
+    field_value_searching: bool,
+    field_index: FieldValueIndex,
+    /// Parsed-once documentation overlay (help/units + explanations) per group
+    /// JSON, keyed by definition file path. Built lazily during render.
+    def_docs_cache: HashMap<PathBuf, Rc<DefDocs>>,
+    tsv_paste: Option<TsvPasteState>,
+    rename_tag: Option<RenameTagState>,
     status: String,
     folder_refactor: Option<FolderRefactorUiState>,
     /// True while a background full-scan of a loose-folder source is running.
@@ -194,10 +223,12 @@ impl Baboon {
             filter_cache: FilterCache::default(),
             source_generation: 0,
             browser_mode: prefs.browser_mode,
+            browser_sort: prefs.browser_sort,
             show_browser_prefixes: prefs.show_browser_prefixes,
             double_click_to_open_tags: prefs.double_click_to_open_tags,
             show_block_sizes: prefs.show_block_sizes,
             expert_mode: prefs.expert_mode,
+            field_search_passive: prefs.field_search_passive,
             dark_mode: prefs.dark_mode,
             ui_scale: prefs.ui_scale,
             pending_ui_scale: prefs.ui_scale,
@@ -230,6 +261,21 @@ impl Baboon {
             blender_path: prefs.blender_path,
             color_popup: None,
             function_popup: None,
+            query_results: None,
+            tag_diff: None,
+            content_explorer: None,
+            keywords: KeywordStore::default(),
+            keyword_input: String::new(),
+            keyword_chooser_open: false,
+            reveal_target: None,
+            field_value_search_open: false,
+            field_value_query: String::new(),
+            field_value_group: String::new(),
+            field_value_searching: false,
+            field_index: FieldValueIndex::default(),
+            def_docs_cache: HashMap::new(),
+            tsv_paste: None,
+            rename_tag: None,
             status: "Ready".to_owned(),
             folder_refactor: None,
             scanning_entries: false,
@@ -432,6 +478,7 @@ mod tests {
             width: 1,
             height: 1,
             image_count: 1,
+            mip_count: 1,
             format_name: "a8r8g8b8".to_owned(),
             type_name: "2D texture".to_owned(),
             rgba: vec![10, 20, 30, 128],

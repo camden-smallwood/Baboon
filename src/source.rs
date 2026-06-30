@@ -138,6 +138,11 @@ impl ReverseDependencyIndex {
             .unwrap_or(&[])
     }
 
+    /// The dependencies a tag declares (what it references).
+    pub fn dependencies_of(&self, tag_key: &str) -> &[DependencyRef] {
+        self.by_tag.get(tag_key).map(Vec::as_slice).unwrap_or(&[])
+    }
+
     pub fn len(&self) -> usize {
         self.by_tag.len()
     }
@@ -343,6 +348,31 @@ pub fn read_entry(source: &TagSource, entry: &TagEntry) -> Result<TagFile> {
             anyhow::bail!("monolithic entry selected outside a monolithic source")
         }
     }
+}
+
+/// Read a tag at `path` for preview/decoding (e.g. a referenced bitmap), handling
+/// classic Halo CE / Halo 2 tags that need a JSON layout + `read_classic_tag_file`
+/// rather than the plain `TagFile::read`. `group_tag` selects the classic layout.
+pub fn read_tag_at_path(
+    path: &Path,
+    game: Option<&str>,
+    definitions_root: Option<&Path>,
+    group_tag: u32,
+) -> Result<TagFile> {
+    let bytes = std::fs::read(path)?;
+    if ClassicHeader::parse(&bytes).is_some() {
+        let game = game.context("classic tag requires a detected game profile")?;
+        let definitions_root =
+            definitions_root.context("classic tag requires a definitions root")?;
+        let group_name = blam_tags::paths::group_tag_to_extension(group_tag)
+            .context("unknown group for classic tag layout")?;
+        let def_path = definitions_root.join(game).join(format!("{group_name}.json"));
+        let layout = TagLayout::from_json(&def_path)
+            .with_context(|| format!("failed to load classic layout {}", def_path.display()))?;
+        return read_classic_tag_file(&bytes, layout)
+            .map_err(|error| anyhow::anyhow!("failed to decode classic tag: {error}"));
+    }
+    TagFile::read(path).map_err(Into::into)
 }
 
 fn read_loose_tag(
@@ -635,6 +665,12 @@ pub fn reverse_dependency_index_path(game: &str) -> PathBuf {
     )
 }
 
+/// Sidecar file storing user keywords for a game's tags (kept outside the tag
+/// binaries). Keyed by tag entry key → sorted unique keyword list.
+pub fn keywords_path(game: &str) -> PathBuf {
+    app_cache_path(&format!("{game}_keywords.json"), "Baboon", "baboon")
+}
+
 fn legacy_index_path(game: &str) -> PathBuf {
     app_cache_path(&format!("{game}_index.json"), "Genesis", "genesis")
 }
@@ -792,7 +828,7 @@ pub fn load_reverse_dependency_index(game: &str, root: &Path) -> Option<ReverseD
     Some(index)
 }
 
-fn dependency_key(group_tag: u32, rel_path: &str) -> String {
+pub(crate) fn dependency_key(group_tag: u32, rel_path: &str) -> String {
     format!(
         "{group_tag:08x}\t{}",
         rel_path.replace('/', "\\").to_ascii_lowercase()
@@ -914,14 +950,17 @@ fn detect_ek_root_with_aliases(
 }
 
 fn ek_folder_game(name: &str) -> Option<&'static str> {
+    // Recognize both the editing-kit folder names (e.g. `H3EK`) and the
+    // canonical game-id folder names (e.g. `halo3_mcc`) — users often keep tags
+    // under a folder named after the game, not the EK.
     match name.to_ascii_uppercase().as_str() {
         "HCEEK" | "H1EK" | "HALOCEEK" | "HALOCE_MCC" => Some("haloce_mcc"),
         "H2EK" | "HALO2EK" | "HALO2_MCC" => Some("halo2_mcc"),
-        "HREK" => Some("haloreach_mcc"),
-        "H4EK" => Some("halo4_mcc"),
-        "H3ODSTEK" => Some("halo3odst_mcc"),
-        "H3EK" => Some("halo3_mcc"),
-        "H2AMPEK" | "H2AEK" => Some("halo2amp_mcc"),
+        "HREK" | "HALOREACH_MCC" => Some("haloreach_mcc"),
+        "H4EK" | "HALO4_MCC" => Some("halo4_mcc"),
+        "H3ODSTEK" | "HALO3ODST_MCC" => Some("halo3odst_mcc"),
+        "H3EK" | "HALO3_MCC" => Some("halo3_mcc"),
+        "H2AMPEK" | "H2AEK" | "HALO2AMP_MCC" => Some("halo2amp_mcc"),
         _ => None,
     }
 }
@@ -1188,6 +1227,22 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn detect_game_from_game_id_folder_name() {
+        // A folder named after the game (not the EK) must still resolve, so the
+        // definitions/per-game features (incl. the doc overlay) work.
+        assert_eq!(
+            detect_ek_game(Path::new("/Users/x/Halo/halo3_mcc/tags/objects")),
+            Some("halo3_mcc")
+        );
+        assert_eq!(
+            detect_ek_game(Path::new("/data/haloreach_mcc/tags")),
+            Some("haloreach_mcc")
+        );
+        // EK-style names still work.
+        assert_eq!(detect_ek_game(Path::new("/x/H3EK/tags")), Some("halo3_mcc"));
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let stamp = SystemTime::now()

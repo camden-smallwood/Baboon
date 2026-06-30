@@ -338,6 +338,28 @@ pub(super) fn draw_function_editor_contents(
             });
             ui.add_space(8.0);
         } else {
+            // Color graph: show the evaluated endpoint colors as swatches on the
+            // output axis (top = input 1.0, bottom = input 0.0), matching the
+            // scalar high/low layout.
+            ui.vertical(|ui| {
+                let mut endpoint_swatch = |ui: &mut Ui, x: f32| {
+                    let c = view.function.evaluate_color(x, x);
+                    let (r, g, b) = (
+                        float_channel_to_u8(c.red),
+                        float_channel_to_u8(c.green),
+                        float_channel_to_u8(c.blue),
+                    );
+                    let (rect, resp) =
+                        ui.allocate_exact_size(egui::Vec2::new(22.0, 18.0), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, 2.0, Color32::from_rgb(r, g, b));
+                    ui.painter()
+                        .rect_stroke(rect, 2.0, egui::Stroke::new(1.0, grid_line()));
+                    resp.on_hover_text(format!("input {x:.0}: R{r} G{g} B{b}"));
+                };
+                endpoint_swatch(ui, 1.0);
+                ui.add_space(118.0);
+                endpoint_swatch(ui, 0.0);
+            });
             ui.add_space(8.0);
         }
 

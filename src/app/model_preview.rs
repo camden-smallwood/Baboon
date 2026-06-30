@@ -63,7 +63,21 @@ pub(super) fn draw_model_preview_panel(
         .id_salt(("model_preview", &entry.key))
         .default_open(true)
         .show(ui, |ui| {
-            ensure_model_preview_loaded(tag, entry, names, source, state);
+            // The parse is synchronous; on the first frame for a tag, show a
+            // spinner, kick the (blocking) parse, and repaint so the decoded
+            // model appears next frame instead of a blank panel. (A future
+            // change can move the parse to a worker thread — see plan 1.9.)
+            let needs_load = state.loaded_key.as_deref() != Some(entry.key.as_str())
+                || state.data.is_none();
+            if needs_load {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("Loading model…").color(subtle_dark()));
+                });
+                ensure_model_preview_loaded(tag, entry, names, source, state);
+                ui.ctx().request_repaint();
+                return;
+            }
 
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Scale").color(subtle_dark()));
@@ -79,6 +93,13 @@ pub(super) fn draw_model_preview_panel(
                     state.scale = 1.0;
                 }
                 ui.checkbox(&mut state.show_markers, "Markers");
+                if state.show_markers {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut state.marker_filter)
+                            .hint_text("filter markers…")
+                            .desired_width(110.0),
+                    );
+                }
                 ui.checkbox(&mut state.show_wireframe, "Wireframe");
                 ui.checkbox(&mut state.show_backfaces, "Backfaces");
                 ui.label(RichText::new("Viewport").color(subtle_dark()));
@@ -190,7 +211,10 @@ fn ensure_model_preview_loaded(
         .and_then(|result| result)
         .map(|data| {
             state.render_model_path = Some(data.render_model_path.clone());
-            reset_model_preview_selection(state, &data, None);
+            // Auto-select the canonical variant (named `default`, else the first)
+            // so the preview opens showing a complete configured model.
+            let default_variant = default_variant_index(&data.variants);
+            reset_model_preview_selection(state, &data, default_variant);
             data
         }),
     );
@@ -445,19 +469,49 @@ fn expand_preview_bounds_local(min: &mut [f32; 3], max: &mut [f32; 3], point: [f
     }
 }
 
+struct RawVariantRegion {
+    perm: Option<String>,
+    parent: i128,
+}
+struct RawVariant {
+    name: String,
+    regions: Vec<(String, RawVariantRegion)>,
+}
+
+/// Resolve a region's effective permutation for variant `vi`, following the
+/// per-region `parent variant` chain when the variant doesn't set it directly.
+fn resolve_variant_region(raw: &[RawVariant], vi: usize, region: &str, depth: usize) -> Option<String> {
+    if depth > raw.len() {
+        return None; // cycle guard
+    }
+    let rr = raw
+        .get(vi)?
+        .regions
+        .iter()
+        .find(|(name, _)| name == region)
+        .map(|(_, r)| r)?;
+    if let Some(perm) = &rr.perm {
+        return Some(perm.clone());
+    }
+    if rr.parent >= 0 && rr.parent as usize != vi {
+        return resolve_variant_region(raw, rr.parent as usize, region, depth + 1);
+    }
+    None
+}
+
 fn read_model_variants(tag: &TagFile) -> Vec<ModelVariantPreview> {
     let Some(variants) = tag.root().field_path("variants").and_then(|f| f.as_block()) else {
         return Vec::new();
     };
-    let mut out = Vec::with_capacity(variants.len());
+    // Pass 1: read each variant's raw region entries (own perm + parent index).
+    let mut raw: Vec<RawVariant> = Vec::with_capacity(variants.len());
     for index in 0..variants.len() {
         let Some(variant) = variants.element(index) else {
             continue;
         };
         let name =
             read_named_string_exact(&variant, "name").unwrap_or_else(|| format!("variant {index}"));
-        let mut regions = HashMap::new();
-        let mut has_explicit_regions = false;
+        let mut regions = Vec::new();
         if let Some(region_block) = variant.field("regions").and_then(|f| f.as_block()) {
             for region_index in 0..region_block.len() {
                 let Some(region) = region_block.element(region_index) else {
@@ -466,24 +520,51 @@ fn read_model_variants(tag: &TagFile) -> Vec<ModelVariantPreview> {
                 let Some(region_name) = read_named_string_exact(&region, "region name") else {
                     continue;
                 };
-                has_explicit_regions = true;
-                let permutation = region
+                let perm = region
                     .field("permutations")
                     .and_then(|f| f.as_block())
                     .and_then(|perms| perms.element(0))
                     .and_then(|perm| read_named_string_exact(&perm, "permutation name"));
-                if let Some(permutation) = permutation {
-                    regions.insert(region_name, permutation);
-                }
+                let parent = region.read_int_any("parent variant").unwrap_or(-1);
+                regions.push((region_name, RawVariantRegion { perm, parent }));
+            }
+        }
+        raw.push(RawVariant { name, regions });
+    }
+    // Pass 2: resolve each region through the parent chain into a flat map.
+    let mut out = Vec::with_capacity(raw.len());
+    for vi in 0..raw.len() {
+        let mut regions = HashMap::new();
+        let mut listed_regions = std::collections::HashSet::new();
+        for (region_name, _) in &raw[vi].regions {
+            listed_regions.insert(region_name.clone());
+            if regions.contains_key(region_name) {
+                continue;
+            }
+            if let Some(perm) = resolve_variant_region(&raw, vi, region_name, 0) {
+                regions.insert(region_name.clone(), perm);
             }
         }
         out.push(ModelVariantPreview {
-            name,
+            name: raw[vi].name.clone(),
             regions,
-            has_explicit_regions,
+            listed_regions,
         });
     }
     out
+}
+
+/// The variant to select on load: one literally named `default`, else the first
+/// (the canonical entry — `chief`, `minor`, `minor_scl`). `None` for models with
+/// no variants (CE gbxmodels), which fall back to base permutations.
+fn default_variant_index(variants: &[ModelVariantPreview]) -> Option<usize> {
+    if variants.is_empty() {
+        return None;
+    }
+    variants
+        .iter()
+        .position(|v| v.name.eq_ignore_ascii_case("default"))
+        .or(Some(0))
 }
 
 fn read_named_string_exact(tag_struct: &TagStruct<'_>, expected: &str) -> Option<String> {
@@ -520,7 +601,17 @@ fn reset_model_preview_selection(
     variant: Option<usize>,
 ) {
     state.selected_variant = variant;
-    state.region_selections.clear();
+    state.region_selections = compute_variant_selection(data, variant);
+}
+
+/// The region selection (enabled + permutation per region) that selecting
+/// `variant` (`None` = base/`<None>`) produces. Pure — used both to apply a
+/// variant and to reverse-detect which variant the live selection matches.
+fn compute_variant_selection(
+    data: &ModelPreviewData,
+    variant: Option<usize>,
+) -> HashMap<String, ModelRegionSelection> {
+    let mut selections = HashMap::new();
     let selected_variant = variant.and_then(|idx| data.variants.get(idx));
     let variant_aliases = selected_variant
         .map(|variant| variant_permutation_aliases(&variant.name))
@@ -532,23 +623,29 @@ fn reset_model_preview_selection(
         let explicit_perm = variant_perm
             .filter(|name| region.permutations.iter().any(|p| p == *name))
             .cloned();
-        let fallback_for_unmapped = selected_variant
-            .filter(|variant| !variant.has_explicit_regions)
-            .and(Some(default_perm.clone()));
+        // Whether the variant's region block NAMES this region at all. A listed
+        // region with no resolvable permutation is explicitly REMOVED (hidden); an
+        // UNLISTED region is just uncustomised and falls back to the base
+        // permutation (shown) — e.g. the major elite doesn't list `helmet`, so it
+        // gets the base helmet, while spec-ops lists it empty to drop it.
+        let listed = selected_variant.is_some_and(|v| v.listed_regions.contains(&region.name));
         let permutation = alias_perm
             .clone()
             .or(explicit_perm.clone())
-            .or(fallback_for_unmapped.clone())
             .unwrap_or(default_perm);
         let enabled = match selected_variant {
-            Some(variant) => {
-                alias_perm.is_some()
-                    || explicit_perm.is_some()
-                    || (!variant.has_explicit_regions && !region.permutations.is_empty())
+            Some(_) => {
+                if alias_perm.is_some() || explicit_perm.is_some() {
+                    true // the variant provides a permutation for this region
+                } else if listed {
+                    false // listed with an empty permutation => explicitly removed
+                } else {
+                    !region.permutations.is_empty() // uncustomised => base, shown
+                }
             }
             None => !region.permutations.is_empty(),
         };
-        state.region_selections.insert(
+        selections.insert(
             region.name.clone(),
             ModelRegionSelection {
                 enabled,
@@ -556,6 +653,38 @@ fn reset_model_preview_selection(
             },
         );
     }
+    selections
+}
+
+/// Reverse-sync: which variant choice (`None` = `<None>`/base, `Some(idx)` =
+/// a named variant) the live region selection currently matches, or `None` if
+/// it matches no known variant ("(custom)"). Checks the active selection first
+/// so an exact match stays put.
+fn detect_active_variant(
+    data: &ModelPreviewData,
+    state: &ModelPreviewState,
+) -> Option<Option<usize>> {
+    let matches = |choice: Option<usize>| {
+        let computed = compute_variant_selection(data, choice);
+        computed.len() == state.region_selections.len()
+            && computed
+                .iter()
+                .all(|(name, sel)| state.region_selections.get(name) == Some(sel))
+    };
+    let current = state.selected_variant;
+    if matches(current) {
+        return Some(current);
+    }
+    if current.is_some() && matches(None) {
+        return Some(None);
+    }
+    for idx in 0..data.variants.len() {
+        let choice = Some(idx);
+        if choice != current && matches(choice) {
+            return Some(choice);
+        }
+    }
+    None // matches no known variant → "(custom)"
 }
 
 fn matching_variant_permutation(
@@ -600,13 +729,25 @@ fn draw_variant_controls(
     edit: &mut FieldEditContext<'_>,
 ) -> bool {
     let mut mutation_requested = false;
+    // Reverse-sync: reflect manual region/permutation tweaks in the combo —
+    // show the matching variant, or "(custom)" when the live selection matches
+    // none. When it lands exactly on a variant, adopt it so Update/Drop target
+    // the shown variant.
+    let active_variant = detect_active_variant(data, state);
+    if let Some(choice) = active_variant {
+        state.selected_variant = choice;
+    }
     ui.horizontal(|ui| {
         ui.label(RichText::new("Variant").color(subtle_dark()));
-        let selected = state
-            .selected_variant
-            .and_then(|idx| data.variants.get(idx))
-            .map(|variant| variant.name.as_str())
-            .unwrap_or("<None>");
+        let selected = match active_variant {
+            Some(None) => "<None>",
+            Some(Some(idx)) => data
+                .variants
+                .get(idx)
+                .map(|variant| variant.name.as_str())
+                .unwrap_or("<None>"),
+            None => "(custom)",
+        };
         egui::ComboBox::from_id_salt(("model_preview_variant", &data.source_key))
             .selected_text(selected)
             .width(180.0)
@@ -832,7 +973,14 @@ fn draw_model_viewport(
         } else {
             None
         };
+        let marker_filter = state.marker_filter.trim().to_ascii_lowercase();
         for marker in &data.preview.markers {
+            // Name filter (case-insensitive substring; empty = show all).
+            if !marker_filter.is_empty()
+                && !marker.name.to_ascii_lowercase().contains(&marker_filter)
+            {
+                continue;
+            }
             let projected = camera.project(marker.position);
             let axis_deltas = marker_axis_screen_deltas(&camera, marker.axes);
             draw_marker_axes(&painter, projected.pos, axis_deltas);

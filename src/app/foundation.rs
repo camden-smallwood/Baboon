@@ -34,6 +34,7 @@ pub(super) fn supports_field_search(entry: &TagEntry) -> bool {
 pub(super) fn compute_pending_field_filter(
     tag: &TagFile,
     supports: bool,
+    passive: bool,
     tag_key: &str,
     field_search: &HashMap<String, String>,
     field_search_applied: &mut HashMap<String, String>,
@@ -51,31 +52,49 @@ pub(super) fn compute_pending_field_filter(
             .remove(tag_key)
             .map(|_| FieldFilterAction::RestoreDefaults);
     }
+    if passive {
+        // Passive mode highlights + keeps matches open every frame (it never
+        // collapses), so re-apply continuously rather than one-shot.
+        field_search_applied.insert(tag_key.to_owned(), query.clone());
+        return Some(FieldFilterAction::Apply(compute_field_filter(
+            tag, &query, true,
+        )));
+    }
     if field_search_applied.get(tag_key).map(String::as_str) == Some(query.as_str()) {
         // Already applied; leave the user's manual expand/collapse intact.
         return None;
     }
     field_search_applied.insert(tag_key.to_owned(), query.clone());
-    Some(FieldFilterAction::Apply(compute_field_filter(tag, &query)))
+    Some(FieldFilterAction::Apply(compute_field_filter(
+        tag, &query, false,
+    )))
 }
 
 /// Build the set of collapsible nodes to open for a "Search fields" query:
 /// every struct / block / array whose (display) name contains `query`, plus
 /// all of their ancestor nodes, plus the ancestors of any matching leaf field.
 /// `query` must already be lowercased and non-empty.
-pub(super) fn compute_field_filter(tag: &TagFile, query: &str) -> FieldFilter {
+pub(super) fn compute_field_filter(tag: &TagFile, query: &str, passive: bool) -> FieldFilter {
     let mut open_paths = std::collections::HashSet::new();
-    collect_open_paths(tag.root(), "", query, &mut open_paths);
-    FieldFilter { open_paths }
+    let mut highlight_paths = std::collections::HashSet::new();
+    collect_open_paths(tag.root(), "", query, &mut open_paths, &mut highlight_paths);
+    FieldFilter {
+        open_paths,
+        highlight_paths,
+        passive,
+    }
 }
 
 /// Returns whether `tag_struct` (or anything beneath it) matched, so the
-/// caller can mark the containing node open.
+/// caller can mark the containing node open. Records every node on a match path
+/// in `open_paths`, and every field (leaf or node) whose own name matched in
+/// `highlight_paths`.
 fn collect_open_paths(
     tag_struct: TagStruct<'_>,
     canon_prefix: &str,
     query: &str,
     open_paths: &mut std::collections::HashSet<String>,
+    highlight_paths: &mut std::collections::HashSet<String>,
 ) -> bool {
     let mut any = false;
     for field in tag_struct.fields() {
@@ -89,17 +108,21 @@ fn collect_open_paths(
             format!("{canon_prefix}/{}", field.name())
         };
 
+        if name_matches {
+            highlight_paths.insert(canon.clone());
+        }
+
         let child_matched = if let Some(nested) = field.as_struct() {
-            collect_open_paths(nested, &canon, query, open_paths)
+            collect_open_paths(nested, &canon, query, open_paths, highlight_paths)
         } else if let Some(block) = field.as_block() {
             block
                 .element(0)
-                .map(|el| collect_open_paths(el, &canon, query, open_paths))
+                .map(|el| collect_open_paths(el, &canon, query, open_paths, highlight_paths))
                 .unwrap_or(false)
         } else if let Some(array) = field.as_array() {
             array
                 .element(0)
-                .map(|el| collect_open_paths(el, &canon, query, open_paths))
+                .map(|el| collect_open_paths(el, &canon, query, open_paths, highlight_paths))
                 .unwrap_or(false)
         } else {
             // Leaf field: a name match opens its ancestors but adds no node.
@@ -144,9 +167,7 @@ pub(super) fn draw_struct_fields(
         depth <= 1,
         open_override,
         |ui| {
-            for field in tag_struct.fields_all() {
-                draw_field(ui, field, names, depth, expert_mode, path_prefix, edit);
-            }
+            draw_fields_with_docs(ui, &tag_struct, names, depth, expert_mode, path_prefix, edit, None);
         },
     );
 }
@@ -176,12 +197,16 @@ pub(super) fn draw_inherited_object_fields(
             open_override,
             |ui| {
                 let parent_field = inherited_parent_field_name(*struct_value);
-                for field in struct_value.fields_all() {
-                    if parent_field.is_some_and(|name| name == field.name()) {
-                        continue;
-                    }
-                    draw_field(ui, field, names, 0, expert_mode, path_prefix, edit);
-                }
+                draw_fields_with_docs(
+                    ui,
+                    struct_value,
+                    names,
+                    0,
+                    expert_mode,
+                    path_prefix,
+                    edit,
+                    parent_field,
+                );
             },
         );
     }
@@ -225,6 +250,88 @@ pub(super) fn is_inherited_parent_name(name: &str) -> bool {
     )
 }
 
+/// Render a struct's fields, overlaying the JSON-definition docs: inject
+/// explanation rows at their authored positions and attach each field's
+/// help/units (recovered from the definition, since shipped tags strip them).
+/// `skip_field` omits one field by name (used to hide an inherited parent).
+pub(super) fn draw_fields_with_docs(
+    ui: &mut Ui,
+    tag_struct: &TagStruct<'_>,
+    names: &TagNameIndex,
+    depth: usize,
+    expert_mode: bool,
+    path_prefix: &str,
+    edit: &mut FieldEditContext<'_>,
+    skip_field: Option<&str>,
+) {
+    let guid = tag_struct.definition().guid();
+    let entries: &[DefEntry] = edit.docs.map(|docs| docs.entries_for(&guid)).unwrap_or(&[]);
+    let mut cursor = 0usize;
+    for field in tag_struct.fields_all() {
+        if skip_field == Some(field.name()) {
+            continue;
+        }
+        // Find this field's matching definition entry (clean names line up with
+        // the engine-stripped tag name); emit any explanations that precede it.
+        let mut meta_override = None;
+        if !entries.is_empty() {
+            let name = field.name();
+            if let Some(match_idx) = (cursor..entries.len()).find(|&i| {
+                matches!(&entries[i], DefEntry::Field { clean_name, .. } if clean_name == name)
+            }) {
+                for (offset, entry) in entries[cursor..match_idx].iter().enumerate() {
+                    if let DefEntry::Explanation { title, body } = entry {
+                        draw_foundation_explanation_row(
+                            ui,
+                            title,
+                            Some(body),
+                            depth,
+                            (path_prefix, cursor + offset),
+                        );
+                    }
+                }
+                if let DefEntry::Field { help, unit, range, .. } = &entries[match_idx] {
+                    // The engine strips everything after `:` from the field name,
+                    // so unit/range/help are recovered from the definition here.
+                    let mut meta = field_display_meta(name);
+                    meta.help = help.clone();
+                    meta.unit = unit.clone();
+                    meta.range = range.clone();
+                    meta_override = Some(meta);
+                }
+                cursor = match_idx + 1;
+            }
+        }
+        // Resolve a block-index field's target block (sibling or ancestor) for
+        // the element dropdown; `None` falls back to the numeric editor.
+        let root = edit.root;
+        let block_index = block_index_target_options(tag_struct, &field, names, root, path_prefix);
+        draw_field(
+            ui,
+            field,
+            names,
+            depth,
+            expert_mode,
+            path_prefix,
+            edit,
+            meta_override,
+            block_index,
+        );
+    }
+    // Any explanations after the last matched field.
+    for (offset, entry) in entries[cursor..].iter().enumerate() {
+        if let DefEntry::Explanation { title, body } = entry {
+            draw_foundation_explanation_row(
+                ui,
+                title,
+                Some(body),
+                depth,
+                (path_prefix, cursor + offset),
+            );
+        }
+    }
+}
+
 pub(super) fn draw_field(
     ui: &mut Ui,
     field: TagField<'_>,
@@ -233,9 +340,13 @@ pub(super) fn draw_field(
     expert_mode: bool,
     path_prefix: &str,
     edit: &mut FieldEditContext<'_>,
+    meta_override: Option<FieldDisplayMeta>,
+    block_index: Option<(Vec<String>, String)>,
 ) {
     let field_path = append_field_path(path_prefix, field.name());
-    let meta = field_display_meta(field.name());
+    // `meta_override` carries help/units recovered from the JSON definition
+    // (shipped tags strip them); fall back to parsing the tag's own field name.
+    let meta = meta_override.unwrap_or_else(|| field_display_meta(field.name()));
     if meta.advanced && !expert_mode {
         return;
     }
@@ -251,30 +362,60 @@ pub(super) fn draw_field(
             return;
         }
         TagFieldType::Explanation => {
-            draw_foundation_explanation_row(ui, field.name(), &field_path, depth, edit);
+            // Note: shipped tags strip explanation fields from their layout, so
+            // this rarely fires — explanations are normally injected from the
+            // definition docs in `draw_fields_with_docs`.
+            draw_foundation_explanation_row(ui, field.name(), field.explanation(), depth, &field_path);
             return;
         }
         _ => {}
     }
+    // Passive field-search: tint rows whose name matched the query.
+    let highlight = edit.field_highlighted(&field_path);
+    let highlight_fill = egui::Color32::from_rgba_unmultiplied(255, 214, 0, 38);
     if let Some(function) = field.as_function() {
-        draw_foundation_function_row(ui, &meta, &function, depth, &field_path, edit);
+        if highlight {
+            egui::Frame::none().fill(highlight_fill).show(ui, |ui| {
+                draw_foundation_function_row(ui, &meta, &function, depth, &field_path, edit);
+            });
+        } else {
+            draw_foundation_function_row(ui, &meta, &function, depth, &field_path, edit);
+        }
         return;
     }
     if let Some(value) = field.value() {
         if is_hidden_non_expert_value(&value, expert_mode) {
             return;
         }
-        draw_foundation_value_row(
-            ui,
-            field,
-            &meta,
-            field.type_name(),
-            &value,
-            names,
-            depth,
-            &field_path,
-            edit,
-        );
+        if highlight {
+            egui::Frame::none().fill(highlight_fill).show(ui, |ui| {
+                draw_foundation_value_row(
+                    ui,
+                    field,
+                    &meta,
+                    field.type_name(),
+                    &value,
+                    names,
+                    depth,
+                    &field_path,
+                    edit,
+                    block_index.as_ref(),
+                );
+            });
+        } else {
+            draw_foundation_value_row(
+                ui,
+                field,
+                &meta,
+                field.type_name(),
+                &value,
+                names,
+                depth,
+                &field_path,
+                edit,
+                block_index.as_ref(),
+            );
+        }
         return;
     }
 
@@ -360,103 +501,81 @@ pub(super) fn draw_struct_fields_inline(
     path_prefix: &str,
     edit: &mut FieldEditContext<'_>,
 ) {
-    for field in tag_struct.fields_all() {
-        draw_field(ui, field, names, depth, expert_mode, path_prefix, edit);
-    }
+    draw_fields_with_docs(ui, &tag_struct, names, depth, expert_mode, path_prefix, edit, None);
 }
 
 pub(super) fn draw_foundation_explanation_row(
     ui: &mut Ui,
     name: &str,
-    path: &str,
+    body: Option<&str>,
     depth: usize,
-    edit: &FieldEditContext<'_>,
+    id_salt: impl std::hash::Hash,
 ) {
-    let Some(text) = explanation_text_for_field(name, path, edit) else {
+    // `name` is the explanation's title (often a section header like
+    // "$$$ WEAPON $$$", sometimes empty); `body` is its text, read straight
+    // from the loaded layout (the schema `definition`), with a hardcoded
+    // fallback for the few explanations whose text isn't in the definition.
+    //
+    // Rendered like Foundation's explanation panel: a collapsible (default-open)
+    // bold header bar with a wrapped monospace body — not the previous tiny text.
+    let title = clean_field_name(name);
+    let body = body
+        .map(str::to_owned)
+        .or_else(|| known_explanation_text(name))
+        .unwrap_or_default();
+    let has_body = !body.trim().is_empty();
+    if title.is_empty() && !has_body {
         return;
+    }
+    let header = if title.is_empty() {
+        "(explanation)".to_owned()
+    } else {
+        title
     };
-    if text.trim().is_empty() {
-        return;
-    }
 
-    let indent = depth as f32 * 12.0;
-    let width = (ui.available_width() - indent - 20.0).clamp(360.0, 980.0);
-    ui.horizontal(|ui| {
-        ui.add_space(indent);
-        Frame::none()
-            .fill(foundation_group_bg())
-            .stroke(Stroke::new(1.0, foundation_group_edge()))
-            .inner_margin(egui::Margin::same(8.0))
-            .show(ui, |ui| {
-                ui.set_max_width(width);
-                let label = clean_field_name(name);
-                if !label.is_empty() {
-                    ui.label(RichText::new(label).color(text_dark()).strong().small());
-                    ui.add_space(3.0);
-                }
-                ui.label(RichText::new(text).color(subtle_dark()).small().monospace());
-            });
-    });
-    ui.add_space(3.0);
-}
-
-fn explanation_text_for_field(
-    name: &str,
-    path: &str,
-    edit: &FieldEditContext<'_>,
-) -> Option<String> {
-    explanation_text_from_definition_json(path, edit).or_else(|| known_explanation_text(name))
-}
-
-fn explanation_text_from_definition_json(
-    path: &str,
-    edit: &FieldEditContext<'_>,
-) -> Option<String> {
-    let root = edit.definitions_root?;
-    let game = edit.game?;
-    let group_name = edit.definition_group_name?;
-    let json_path = root.join(game).join(format!("{group_name}.json"));
-    let json = std::fs::read_to_string(json_path).ok()?;
-    let value: Value = serde_json::from_str(&json).ok()?;
-    let structs = value.get("structs")?.as_object()?;
-    let blocks = value.get("blocks")?.as_object()?;
-    let mut struct_name = value
-        .get("block")
-        .and_then(Value::as_str)
-        .and_then(|block_name| blocks.get(block_name))
-        .and_then(|block| block.get("struct"))
-        .and_then(Value::as_str)?;
-
-    for segment in strip_node_indices(path)
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-    {
-        let fields = structs.get(struct_name)?.get("fields")?.as_array()?;
-        let field = fields
-            .iter()
-            .find(|field| field.get("name").and_then(Value::as_str) == Some(segment))?;
-        match field.get("type").and_then(Value::as_str)? {
-            "explanation" => {
-                return field
-                    .get("definition")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
+    ui.scope(|ui| {
+        ui.add_space(2.0);
+        // Full-width header bar (see draw_foundation_group), matching Foundation.
+        ui.visuals_mut().collapsing_header_frame = true;
+        let response = egui::CollapsingHeader::new(
+            RichText::new(header).color(text_dark()).font(bold_font(12.5)),
+        )
+        .id_salt(("foundation_explanation", id_salt))
+        .default_open(true)
+        .show_background(true)
+        .show(ui, |ui| {
+            if has_body {
+                Frame::none()
+                    .fill(foundation_group_bg())
+                    .stroke(Stroke::new(1.0, foundation_group_edge()))
+                    .inner_margin(egui::Margin {
+                        left: 8.0 + depth as f32 * 4.0,
+                        right: 8.0,
+                        top: 6.0,
+                        bottom: 6.0,
+                    })
+                    .show(ui, |ui| {
+                        // The box spans the full parent width (Foundation's
+                        // border is Width=Auto in a stretch StackPanel); only the
+                        // text itself is capped (~650px) and left-aligned.
+                        ui.set_min_width(ui.available_width());
+                        let text_width = ui.available_width().min(650.0);
+                        ui.scope(|ui| {
+                            ui.set_max_width(text_width);
+                            ui.label(
+                                RichText::new(body.trim_end())
+                                    .color(text_dark())
+                                    .monospace()
+                                    .size(12.0),
+                            );
+                        });
+                    });
             }
-            "struct" => {
-                struct_name = field.get("definition").and_then(Value::as_str)?;
-            }
-            "block" => {
-                struct_name = field
-                    .get("definition")
-                    .and_then(Value::as_str)
-                    .and_then(|block_name| blocks.get(block_name))
-                    .and_then(|block| block.get("struct"))
-                    .and_then(Value::as_str)?;
-            }
-            _ => return None,
+        });
+        if response.fully_open() {
+            ui.add_space(3.0);
         }
-    }
-    None
+    });
 }
 
 fn known_explanation_text(name: &str) -> Option<String> {
@@ -591,8 +710,11 @@ pub(super) fn draw_foundation_group(
 ) {
     ui.scope(|ui| {
         ui.add_space(2.0);
+        // Make the header bar span the full container width (egui only fills
+        // width when this is set), matching Foundation's full-width header.
+        ui.visuals_mut().collapsing_header_frame = true;
         let mut header = egui::CollapsingHeader::new(
-            RichText::new(title).color(text_dark()).strong().size(12.5),
+            RichText::new(title).color(text_dark()).font(bold_font(12.5)),
         )
         .id_salt(id_salt)
         .show_background(true);
@@ -655,6 +777,7 @@ pub(super) fn draw_foundation_block(
         &selected_label,
         sel,
         count,
+        Some(block.definition().max_count()),
         edit.editable,
         true, // is a real block — add/delete allowed
         edit.view_scope,
@@ -713,6 +836,23 @@ pub(super) fn draw_foundation_block(
                 elements,
             });
         }
+    }
+
+    // Copy the whole block as TSV (plaintext, Excel-friendly).
+    if actions.copy_block_tsv && count > 0 {
+        let tsv = block_to_tsv(&block, names);
+        if !tsv.is_empty() {
+            ui.output_mut(|output| output.copied_text = tsv);
+        }
+    }
+
+    // Request the TSV-import window for this block.
+    if actions.paste_tsv && count > 0 {
+        *edit.tsv_paste_request = Some(TsvPasteRequest {
+            block_path: path_prefix.to_owned(),
+            block_label: clean_field_name(name),
+            element_count: count,
+        });
     }
 
     // Paste / replace from the clipboard.
@@ -1007,12 +1147,20 @@ pub(super) fn draw_foundation_array(
         block_element_dropdown_label(array.element(sel), names, sel)
     };
     let open_override = edit.resolve_open(path_prefix, depth == 0);
+    // A clipboard is compatible when it came from this same array path.
+    let clipboard_len = edit
+        .block_clipboard
+        .filter(|clip| {
+            edit.editable && clip.group_tag == edit.group_tag && clip.block_path == path_prefix
+        })
+        .map(|clip| clip.elements.len());
     let actions = draw_foundation_block_control(
         ui,
         name,
         &selected_label,
         sel,
         count,
+        None, // arrays are fixed-size — capacity gate not applicable
         edit.editable,
         false, // arrays are fixed-size — no add/delete
         edit.view_scope,
@@ -1021,7 +1169,7 @@ pub(super) fn draw_foundation_array(
         depth,
         depth == 0,
         open_override,
-        None, // arrays are fixed-size — no element paste
+        clipboard_len,
         None,
         |i| block_element_dropdown_label(array.element(i), names, i),
         |ui| {
@@ -1047,10 +1195,80 @@ pub(super) fn draw_foundation_array(
             }
         },
     );
-    // Arrays only support selection changes (no structural edits).
+    // Arrays support selection, read-only copy/TSV, and in-place replace of an
+    // element (their fixed count rules out insert/delete).
     if let Some(new_sel) = actions.new_selection {
         set_block_selected_index(ui, edit, path_prefix, new_sel);
     }
+    let copy_indices: Option<Vec<usize>> = if actions.copy {
+        Some(vec![sel])
+    } else if actions.copy_block {
+        Some((0..count).collect())
+    } else {
+        None
+    };
+    if let Some(indices) = copy_indices {
+        let elements: Vec<_> = indices
+            .iter()
+            .filter_map(|&i| array.element_snapshot(i))
+            .collect();
+        if !elements.is_empty() {
+            *edit.block_clip_request = Some(BlockClipboard {
+                group_tag: edit.group_tag,
+                block_path: path_prefix.to_owned(),
+                label: clean_field_name(name),
+                elements,
+            });
+        }
+    }
+    if actions.replace_element && count > 0 {
+        if let Some(elements) = edit.block_clipboard.map(|clip| clip.elements.clone()) {
+            edit.block_ops.push(BlockOp {
+                path: path_prefix.to_owned(),
+                kind: BlockOpKind::ReplaceElement {
+                    at: sel,
+                    elements,
+                },
+            });
+            set_block_selected_index(ui, edit, path_prefix, sel);
+        }
+    }
+    if actions.copy_block_tsv && count > 0 {
+        let tsv = array_to_tsv(&array, names);
+        if !tsv.is_empty() {
+            ui.output_mut(|output| output.copied_text = tsv);
+        }
+    }
+}
+
+/// The parent block/array path for a block path, for "jump to parent". Strips
+/// the last `/segment` and a trailing element index, e.g.
+/// `regions[0]/permutations` → `regions`. `None` for a top-level block.
+fn parent_block_path(path: &str) -> Option<String> {
+    let cut = path.rfind('/')?;
+    let mut parent = path[..cut].to_string();
+    if parent.ends_with(']') {
+        if let Some(open) = parent.rfind('[') {
+            parent.truncate(open);
+        }
+    }
+    Some(parent)
+}
+
+/// A readable breadcrumb for a block path: cleaned segments (index suffixes
+/// dropped) joined with ` › `, e.g. `regions[0]/permutations` → `regions › permutations`.
+fn breadcrumb_for_path(path: &str) -> String {
+    path.split('/')
+        .map(|segment| clean_field_name(segment.split('[').next().unwrap_or(segment)))
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join(" › ")
+}
+
+/// egui-memory key holding the block path that a pending "jump to parent" should
+/// scroll into view on the next frame.
+fn jump_target_id() -> egui::Id {
+    egui::Id::new("foundation_jump_to_block")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1060,6 +1278,9 @@ pub(super) fn draw_foundation_block_control(
     selected_label: &str,
     selected_index: usize,
     count: usize,
+    // Schema element-count cap (`TagBlockDefinition::max_count()`); `0` or
+    // `None` means unbounded. Gates the grow buttons at capacity.
+    max_count: Option<u32>,
     editable: bool,
     allow_structural: bool,
     view_scope: &str,
@@ -1105,9 +1326,26 @@ pub(super) fn draw_foundation_block_control(
     ui.painter()
         .rect_filled(row_rect, 0.0, foundation_block_bar());
 
+    // 3.4 jump-to-parent: if a child's "↑" targeted this block last frame, bring
+    // its header into view (and clear the pending target).
+    if ui
+        .data(|d| d.get_temp::<String>(jump_target_id()))
+        .as_deref()
+        == Some(path_salt)
+    {
+        ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
+        ui.data_mut(|d| d.remove::<String>(jump_target_id()));
+    }
+
     // At-capacity / empty gating mirrors Guerilla's enable rules.
     let can_edit = editable && allow_structural;
     let has_sel = count > 0;
+    // `max_count` of 0 in the schema means "unbounded".
+    let capacity = max_count.filter(|&m| m != 0).map(|m| m as usize);
+    let at_capacity = capacity.is_some_and(|m| count >= m);
+    let capacity_hint = capacity
+        .filter(|_| at_capacity)
+        .map(|m| format!("Block is at its schema maximum of {m} element(s)"));
     let mut selector_active = false;
 
     ui.allocate_new_ui(
@@ -1116,6 +1354,22 @@ pub(super) fn draw_foundation_block_control(
             ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
             ui.horizontal_centered(|ui| {
                 ui.add_space(depth as f32 * 5.0);
+                // Jump-to-parent (nested blocks only); hover shows the breadcrumb.
+                if depth > 0 {
+                    let jump = ui
+                        .add(egui::Button::new(
+                            RichText::new("↑").color(foundation_block_text()),
+                        ))
+                        .on_hover_text(format!(
+                            "Jump to parent block\n{}",
+                            breadcrumb_for_path(path_salt)
+                        ));
+                    if jump.clicked() {
+                        if let Some(parent) = parent_block_path(path_salt) {
+                            ui.data_mut(|d| d.insert_temp(jump_target_id(), parent));
+                        }
+                    }
+                }
                 let toggle = foundation_header_toggle_cell(ui, state.is_open(), count > 0);
                 if toggle.clicked() && count > 0 {
                     state.toggle(ui);
@@ -1125,27 +1379,65 @@ pub(super) fn draw_foundation_block_control(
                     egui::Label::new(
                         RichText::new(clean_field_name(name))
                             .color(foundation_block_text())
-                            .strong(),
+                            .font(bold_font(12.5)),
                     )
                     .sense(Sense::click()),
                 );
-                // Right-click the block name → copy/paste menu.
-                if allow_structural {
-                    name_label
-                        .on_hover_text("Right-click to copy / paste")
-                        .context_menu(|ui| {
+                // Right-click the block name → copy / paste menu. Copy actions are
+                // read-only and available for any element collection (including
+                // fixed-size arrays); the size/content-changing paste & replace
+                // actions are gated behind `allow_structural`.
+                name_label
+                    .on_hover_text("Right-click for copy / paste options")
+                    .context_menu(|ui| {
+                        // Copy + in-place replace are valid for blocks AND fixed-size
+                        // arrays (no element-count change). The size-changing actions
+                        // (paste/insert, replace-all, add/delete) are blocks only.
+                        if ui
+                            .add_enabled(count > 0, egui::Button::new("Copy element"))
+                            .clicked()
+                        {
+                            actions.copy = true;
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(count > 0, egui::Button::new("Copy entire block"))
+                            .clicked()
+                        {
+                            actions.copy_block = true;
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(count > 0, egui::Button::new("Copy block as TSV"))
+                            .on_hover_text("Copy all elements as tab-separated rows (Excel)")
+                            .clicked()
+                        {
+                            actions.copy_block_tsv = true;
+                            ui.close_menu();
+                        }
+                        // In-place replace of the selected element — never changes
+                        // the count, so it works for arrays too.
+                        if clipboard_len.is_some()
+                            && ui
+                                .add_enabled(
+                                    count > 0,
+                                    egui::Button::new("Replace selected element"),
+                                )
+                                .on_hover_text("Overwrite the selected element with the clipboard")
+                                .clicked()
+                        {
+                            actions.replace_element = true;
+                            ui.close_menu();
+                        }
+                        if allow_structural {
                             if ui
-                                .add_enabled(count > 0, egui::Button::new("Copy element"))
+                                .add_enabled(count > 0, egui::Button::new("Paste TSV…"))
+                                .on_hover_text(
+                                    "Paste tab-separated rows back onto this block's elements",
+                                )
                                 .clicked()
                             {
-                                actions.copy = true;
-                                ui.close_menu();
-                            }
-                            if ui
-                                .add_enabled(count > 0, egui::Button::new("Copy entire block"))
-                                .clicked()
-                            {
-                                actions.copy_block = true;
+                                actions.paste_tsv = true;
                                 ui.close_menu();
                             }
                             ui.separator();
@@ -1154,16 +1446,6 @@ pub(super) fn draw_foundation_block_control(
                                     let noun = if n == 1 { "element" } else { "elements" };
                                     if ui.button(format!("Paste {n} {noun}")).clicked() {
                                         actions.paste = true;
-                                        ui.close_menu();
-                                    }
-                                    if ui
-                                        .add_enabled(
-                                            count > 0,
-                                            egui::Button::new("Replace selected element"),
-                                        )
-                                        .clicked()
-                                    {
-                                        actions.replace_element = true;
                                         ui.close_menu();
                                     }
                                     if ui.button("Replace entire block").clicked() {
@@ -1175,8 +1457,8 @@ pub(super) fn draw_foundation_block_control(
                                     ui.add_enabled(false, egui::Button::new("Paste"));
                                 }
                             }
-                        });
-                }
+                        }
+                    });
                 foundation_header_icon_cell(ui, "[]");
 
                 // Instance selector dropdown — built lazily (only when open).
@@ -1247,21 +1529,42 @@ pub(super) fn draw_foundation_block_control(
                     .on_hover_text("Block memory usage: elements × element byte size");
                 }
 
-                // Structural edit buttons.
-                if foundation_header_button_clicked(ui, "Add", can_edit) {
-                    actions.add = true;
-                }
-                if foundation_header_button_clicked(ui, "Insert", can_edit && has_sel) {
-                    actions.insert = true;
-                }
-                if foundation_header_button_clicked(ui, "Duplicate", can_edit && has_sel) {
-                    actions.duplicate = true;
-                }
-                if foundation_header_button_clicked(ui, "Delete", can_edit && has_sel) {
-                    actions.delete = true;
-                }
-                if foundation_header_button_clicked(ui, "Delete all", can_edit && has_sel) {
-                    actions.delete_all = true;
+                // Structural edit buttons — only for variable-count blocks. Arrays
+                // are fixed-size, so the count-changing actions don't apply and the
+                // buttons are omitted entirely. The grow actions (Add / Insert /
+                // Duplicate) are disabled once the block hits its schema cap.
+                if allow_structural {
+                    let hint = capacity_hint.as_deref();
+                    if foundation_header_button_clicked_hint(
+                        ui,
+                        "Add",
+                        can_edit && !at_capacity,
+                        hint,
+                    ) {
+                        actions.add = true;
+                    }
+                    if foundation_header_button_clicked_hint(
+                        ui,
+                        "Insert",
+                        can_edit && has_sel && !at_capacity,
+                        hint,
+                    ) {
+                        actions.insert = true;
+                    }
+                    if foundation_header_button_clicked_hint(
+                        ui,
+                        "Duplicate",
+                        can_edit && has_sel && !at_capacity,
+                        hint,
+                    ) {
+                        actions.duplicate = true;
+                    }
+                    if foundation_header_button_clicked(ui, "Delete", can_edit && has_sel) {
+                        actions.delete = true;
+                    }
+                    if foundation_header_button_clicked(ui, "Delete all", can_edit && has_sel) {
+                        actions.delete_all = true;
+                    }
                 }
             });
         },
@@ -1388,11 +1691,25 @@ pub(super) fn foundation_header_value_cell(ui: &mut Ui, text: &str, max_width: f
 
 /// Interactive variant that reports whether the button was clicked.
 pub(super) fn foundation_header_button_clicked(ui: &mut Ui, label: &str, enabled: bool) -> bool {
-    ui.add_enabled(
+    foundation_header_button_clicked_hint(ui, label, enabled, None)
+}
+
+/// Like [`foundation_header_button_clicked`] but shows `disabled_hint` as a
+/// hover tooltip while the button is disabled (e.g. block at capacity).
+pub(super) fn foundation_header_button_clicked_hint(
+    ui: &mut Ui,
+    label: &str,
+    enabled: bool,
+    disabled_hint: Option<&str>,
+) -> bool {
+    let response = ui.add_enabled(
         enabled,
         egui::Button::new(RichText::new(label).color(text_dark())).min_size(Vec2::new(54.0, 20.0)),
-    )
-    .clicked()
+    );
+    match disabled_hint {
+        Some(hint) if !enabled => response.on_disabled_hover_text(hint).clicked(),
+        _ => response.clicked(),
+    }
 }
 
 // ── Block element selection (persisted in egui memory, keyed by block path) ──
@@ -1433,7 +1750,7 @@ pub(super) fn draw_foundation_bar(
         ui.visuals_mut().widgets.hovered.bg_fill = Color32::from_rgb(205, 205, 201);
         ui.visuals_mut().widgets.active.bg_fill = Color32::from_rgb(196, 196, 192);
         let response =
-            egui::CollapsingHeader::new(RichText::new(title).color(text_dark()).strong())
+            egui::CollapsingHeader::new(RichText::new(title).color(text_dark()).font(bold_font(12.5)))
                 .default_open(default_open)
                 .show_background(true)
                 .show(ui, |ui| {
@@ -1453,6 +1770,153 @@ pub(super) fn draw_foundation_bar(
     });
 }
 
+/// The signed index held by any block-index value variant.
+fn block_index_value(value: &TagFieldData) -> Option<i64> {
+    match value {
+        TagFieldData::CharBlockIndex(v) | TagFieldData::CustomCharBlockIndex(v) => Some(*v as i64),
+        TagFieldData::ShortBlockIndex(v) | TagFieldData::CustomShortBlockIndex(v) => {
+            Some(*v as i64)
+        }
+        TagFieldData::LongBlockIndex(v) | TagFieldData::CustomLongBlockIndex(v) => Some(*v as i64),
+        _ => None,
+    }
+}
+
+/// Resolve a block-index field's target block, returning `(element labels, full
+/// target block path)`. Checks the field's own struct first (sibling target),
+/// then walks up the ancestry from `root` (ancestor target — e.g. weapon's
+/// "primary barrel" → the root "barrels" block). `None` for non-(plain)
+/// block-index fields, custom indices (no target in the definition), or targets
+/// that don't resolve — callers fall back to the numeric editor.
+pub(super) fn block_index_target_options(
+    tag_struct: &TagStruct<'_>,
+    field: &TagField<'_>,
+    names: &TagNameIndex,
+    root: Option<TagStruct<'_>>,
+    struct_path: &str,
+) -> Option<(Vec<String>, String)> {
+    let target_name = field.definition().block_index_target()?.name().to_owned();
+    if target_name.is_empty() {
+        return None;
+    }
+    // 1) The field's own struct (sibling block).
+    if let Some(found) = find_target_block(tag_struct, &target_name, names, struct_path) {
+        return Some(found);
+    }
+    // 2) Ancestors — walk parent structs up to the root.
+    let root = root?;
+    let mut current = struct_path;
+    while !current.is_empty() {
+        let parent = current.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+        let ancestor = if parent.is_empty() {
+            root
+        } else {
+            root.descend(parent)?
+        };
+        if let Some(found) = find_target_block(&ancestor, &target_name, names, parent) {
+            return Some(found);
+        }
+        if parent.is_empty() {
+            break;
+        }
+        current = parent;
+    }
+    None
+}
+
+/// Find a block field whose definition name is `target_name` directly within
+/// `tag_struct`, returning `(element labels, full block path)`.
+fn find_target_block(
+    tag_struct: &TagStruct<'_>,
+    target_name: &str,
+    names: &TagNameIndex,
+    struct_path: &str,
+) -> Option<(Vec<String>, String)> {
+    for sibling in tag_struct.fields_all() {
+        if let Some(block) = sibling.as_block() {
+            if block.definition().name() == target_name {
+                let labels = (0..block.len())
+                    .map(|i| block_element_dropdown_label(block.element(i), names, i))
+                    .collect();
+                return Some((labels, append_field_path(struct_path, sibling.name())));
+            }
+        }
+    }
+    None
+}
+
+/// A block-index field rendered like Foundation: a dropdown of the target
+/// block's elements with a leading `<none>` (value −1), plus a "go to" button
+/// that scrolls to the referenced element.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_foundation_block_index_row(
+    ui: &mut Ui,
+    meta: &FieldDisplayMeta,
+    current: i64,
+    labels: &[String],
+    target_block_path: &str,
+    depth: usize,
+    path: &str,
+    edit: &mut FieldEditContext<'_>,
+) {
+    let editable = edit.editable && !meta.read_only;
+    let in_range = current >= 0 && (current as usize) < labels.len();
+    let selected_text = if in_range {
+        labels[current as usize].clone()
+    } else {
+        "<none>".to_owned()
+    };
+
+    ui.horizontal(|ui| {
+        ui.add_space(depth as f32 * 12.0);
+        foundation_label_cell(ui, &meta.label, meta.help.as_deref());
+
+        if editable {
+            let mut new_index: Option<i64> = None;
+            egui::ComboBox::from_id_salt(("block_index", path))
+                .selected_text(truncate_for_cell(&selected_text, 280.0))
+                .width(300.0)
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(current < 0, "<none>").clicked() {
+                        new_index = Some(-1);
+                    }
+                    for (i, label) in labels.iter().enumerate() {
+                        if ui.selectable_label(current == i as i64, label).clicked() {
+                            new_index = Some(i as i64);
+                        }
+                    }
+                });
+            if let Some(index) = new_index {
+                edit.pending.push(PendingFieldEdit {
+                    path: path.to_owned(),
+                    input: index.to_string(),
+                });
+            }
+        } else {
+            foundation_input_cell(ui, &selected_text, 300.0);
+        }
+
+        // "Go to" the referenced element: scroll to the target block and select
+        // the element (reuses the 3.4 jump-to-block scroll mechanism).
+        let go_to = ui.add_enabled(
+            in_range,
+            egui::Button::new(RichText::new("↳").color(text_dark()))
+                .min_size(Vec2::new(54.0, 20.0)),
+        );
+        let go_to = if in_range {
+            go_to.on_hover_text(format!(
+                "Go to referenced element\n{target_block_path}[{current}]"
+            ))
+        } else {
+            go_to.on_disabled_hover_text("No referenced element (index is <none>)")
+        };
+        if go_to.clicked() {
+            ui.data_mut(|d| d.insert_temp(jump_target_id(), target_block_path.to_owned()));
+            set_block_selected_index(ui, edit, target_block_path, current as usize);
+        }
+    });
+}
+
 pub(super) fn draw_foundation_value_row(
     ui: &mut Ui,
     field: TagField<'_>,
@@ -1463,7 +1927,15 @@ pub(super) fn draw_foundation_value_row(
     depth: usize,
     path: &str,
     edit: &mut FieldEditContext<'_>,
+    // Resolved (element labels, target block field name) for a block-index field
+    // whose target block was found among the struct's siblings; `None` for
+    // non-block-index fields and unresolvable (custom) indices → numeric editor.
+    block_index: Option<&(Vec<String>, String)>,
 ) {
+    if let (Some((labels, target_path)), Some(index)) = (block_index, block_index_value(value)) {
+        draw_foundation_block_index_row(ui, meta, index, labels, target_path, depth, path, edit);
+        return;
+    }
     if let TagFieldData::TagReference(reference) = value {
         let formatted = format_foundation_scalar_value(names, value);
         // The on-disk tag-ref path is null-terminated; strip the trailing NUL
@@ -1625,7 +2097,7 @@ pub(super) fn draw_foundation_color_row(
 
     ui.horizontal(|ui| {
         ui.add_space(depth as f32 * 12.0);
-        foundation_label_cell(ui, &meta.label);
+        foundation_label_cell(ui, &meta.label, meta.help.as_deref());
         for (label, channel) in channels {
             ui.label(RichText::new(*label).color(subtle_dark()).small());
             foundation_input_cell(ui, &format_pc_float(*channel), 76.0);
@@ -1662,7 +2134,7 @@ pub(super) fn draw_foundation_multi_value_row(
 ) {
     ui.horizontal(|ui| {
         ui.add_space(depth as f32 * 12.0);
-        foundation_label_cell(ui, &meta.label);
+        foundation_label_cell(ui, &meta.label, meta.help.as_deref());
         for (label, value) in parts {
             if !label.is_empty() {
                 ui.label(RichText::new(label).color(subtle_dark()).small());
@@ -1713,7 +2185,7 @@ pub(super) fn draw_foundation_bounds_row(
 
     ui.horizontal(|ui| {
         ui.add_space(indent);
-        foundation_label_cell(ui, &meta.label);
+        foundation_label_cell(ui, &meta.label, meta.help.as_deref());
         let editable = edit.editable && !meta.read_only;
         if editable {
             let lower_response = foundation_text_edit_cell(ui, &mut lower, 92.0, lower_id);
@@ -1773,7 +2245,7 @@ pub(super) fn draw_foundation_component_edit_row(
 
     ui.horizontal(|ui| {
         ui.add_space(indent);
-        foundation_label_cell(ui, &meta.label);
+        foundation_label_cell(ui, &meta.label, meta.help.as_deref());
         let editable = edit.editable && !meta.read_only;
         for (index, (label, _, _, buffer)) in values.iter_mut().enumerate() {
             if !label.is_empty() {
@@ -1837,7 +2309,7 @@ pub(super) fn draw_foundation_meta_text_row(
             .clamp(180.0, 920.0);
     ui.horizontal(|ui| {
         ui.add_space(indent);
-        foundation_label_cell(ui, &meta.label);
+        foundation_label_cell(ui, &meta.label, meta.help.as_deref());
         foundation_input_cell(
             ui,
             value,
@@ -1876,7 +2348,7 @@ pub(super) fn draw_foundation_editable_text_row(
 
     ui.horizontal(|ui| {
         ui.add_space(indent);
-        foundation_label_cell(ui, &meta.label);
+        foundation_label_cell(ui, &meta.label, meta.help.as_deref());
         let width = foundation_value_width(buffer, available_value_width);
         let response = foundation_text_edit_cell(ui, buffer, width, id);
         let commit = response.lost_focus() && buffer.trim() != value.trim();
@@ -1891,6 +2363,43 @@ pub(super) fn draw_foundation_editable_text_row(
         }
         draw_field_help(ui, meta);
     });
+}
+
+/// Red used to flag tag references whose target file is missing on disk.
+pub(super) const REFERENCE_MISSING_COLOR: Color32 = Color32::from_rgb(216, 92, 92);
+
+/// Resolve a tag reference to its on-disk path (loose-folder root) and report
+/// whether the file is **absent**. Returns `false` (i.e. "not known missing")
+/// when there is no loose-folder root or the group's extension is unknown, so
+/// non-folder sources never show false "missing" reds.
+///
+/// NOTE: this stats the filesystem per call. Reference rows are bounded by the
+/// visible fields of one tag, so the per-frame cost is small; R3 will replace
+/// this with a generation-invalidated cache shared with the bitmap-row checks.
+pub(super) fn reference_target_missing(
+    tags_root: Option<&Path>,
+    group_tag: u32,
+    rel_path: &str,
+) -> bool {
+    let Some(root) = tags_root else {
+        return false;
+    };
+    let Some(ext) = blam_tags::paths::group_tag_to_extension(group_tag) else {
+        return false;
+    };
+    let mut rel = rel_path.replace('/', "\\");
+    if !ext.is_empty() {
+        if let Some(stripped) = rel
+            .strip_suffix(&format!(".{ext}"))
+            .or_else(|| rel.strip_suffix(&format!(".{}", ext.to_ascii_uppercase())))
+        {
+            rel = stripped.to_owned();
+        }
+    }
+    if rel.trim().is_empty() {
+        return false;
+    }
+    !blam_tags::paths::resolve_tag_path(root, &rel, ext).exists()
 }
 
 pub(super) fn draw_foundation_tag_reference_row(
@@ -1919,10 +2428,16 @@ pub(super) fn draw_foundation_tag_reference_row(
         *buffer = value.to_owned();
     }
 
-    ui.horizontal(|ui| {
+    let droppable = edit.editable && !meta.read_only;
+    let row_response = ui.horizontal(|ui| {
         ui.add_space(indent);
-        foundation_label_cell(ui, &meta.label);
+        foundation_label_cell(ui, &meta.label, meta.help.as_deref());
         let editable = edit.editable && !meta.read_only;
+        let has_ref = target.is_some();
+        // A non-empty reference whose target file is absent on disk.
+        let missing = target
+            .as_ref()
+            .is_some_and(|(group, rel)| reference_target_missing(edit.tags_root, *group, rel));
         if editable {
             let response = foundation_text_edit_cell(
                 ui,
@@ -1936,6 +2451,22 @@ pub(super) fn draw_foundation_tag_reference_row(
                     input: buffer.trim().to_owned(),
                 });
             }
+        } else if !has_ref {
+            foundation_input_cell_colored(
+                ui,
+                "(no reference)",
+                foundation_value_width("(no reference)", available_value_width),
+                subtle_dark(),
+                Some("This reference is empty"),
+            );
+        } else if missing {
+            foundation_input_cell_colored(
+                ui,
+                value,
+                foundation_value_width(value, available_value_width),
+                REFERENCE_MISSING_COLOR,
+                Some("Referenced tag not found on disk"),
+            );
         } else {
             foundation_input_cell(
                 ui,
@@ -1943,15 +2474,27 @@ pub(super) fn draw_foundation_tag_reference_row(
                 foundation_value_width(value, available_value_width),
             );
         }
+        // Flag a broken reference even while the field is being edited.
+        if missing {
+            ui.label(
+                RichText::new("⚠ missing")
+                    .color(REFERENCE_MISSING_COLOR)
+                    .small(),
+            )
+            .on_hover_text("Referenced tag not found on disk");
+        }
         let browse_clicked =
             foundation_header_button_clicked(ui, "...", editable && edit.tags_root.is_some());
         // Open: load the referenced tag in a new tab (resolved against the
         // loose-folder tags root). Enabled only when the ref is non-empty.
         if foundation_header_button_clicked(ui, "Open", target.is_some()) {
             if let Some((group_tag, rel_path)) = target.clone() {
+                // Alt-click opens the referenced tag in a floating window.
+                let float = ui.input(|i| i.modifiers.alt);
                 *edit.open_request = Some(OpenTagRequest {
                     group_tag,
                     rel_path,
+                    float,
                 });
             }
         }
@@ -1993,7 +2536,40 @@ pub(super) fn draw_foundation_tag_reference_row(
         }
         ui.label(RichText::new(suffix).color(subtle_dark()).small());
         draw_field_help(ui, meta);
-    });
+    })
+    .response;
+
+    // Drag-and-drop: drop a tag from the browser onto this row to set the
+    // reference. Accept only when the field is editable and the dropped group
+    // matches the current target's group (an empty reference accepts any group,
+    // mirroring free-form typing).
+    if droppable {
+        let accepts = |payload: &DraggedTagRef| match &target {
+            Some((group, _)) => *group == payload.group_tag,
+            None => true,
+        };
+        if let Some(payload) = row_response.dnd_hover_payload::<DraggedTagRef>() {
+            let color = if accepts(&payload) {
+                Color32::from_rgb(120, 170, 90)
+            } else {
+                REFERENCE_MISSING_COLOR
+            };
+            ui.painter().rect_stroke(
+                row_response.rect,
+                3.0,
+                Stroke::new(1.5, color),
+            );
+        }
+        if let Some(payload) = row_response.dnd_release_payload::<DraggedTagRef>() {
+            if accepts(&payload) {
+                *buffer = payload.input.clone();
+                edit.pending.push(PendingFieldEdit {
+                    path: path.to_owned(),
+                    input: payload.input.clone(),
+                });
+            }
+        }
+    }
 }
 
 /// Strip the trailing NUL terminator (and surrounding whitespace) from an
@@ -2234,7 +2810,7 @@ pub(super) fn draw_foundation_function_row(
 ) {
     ui.horizontal_top(|ui| {
         ui.add_space(depth as f32 * 12.0);
-        foundation_label_cell(ui, &meta.label);
+        foundation_label_cell(ui, &meta.label, meta.help.as_deref());
         Frame::none()
             .fill(foundation_group_bg())
             .stroke(Stroke::new(1.0, foundation_group_edge()))
@@ -2296,7 +2872,7 @@ pub(super) fn draw_foundation_inline_function_row(
     view = view.with_edit(foundation_function_edit_paths(data_path));
     ui.horizontal_top(|ui| {
         ui.add_space(depth as f32 * 12.0);
-        foundation_label_cell(ui, &label);
+        foundation_label_cell(ui, &label, None);
         Frame::none()
             .fill(foundation_group_bg())
             .stroke(Stroke::new(1.0, foundation_group_edge()))
@@ -2359,7 +2935,7 @@ pub(super) fn draw_foundation_enum_row(
     let mut selected = current.unwrap_or(-1);
     ui.horizontal(|ui| {
         ui.add_space(depth as f32 * 12.0);
-        foundation_label_cell(ui, &meta.label);
+        foundation_label_cell(ui, &meta.label, meta.help.as_deref());
         ui.add_enabled_ui(edit.editable && !meta.read_only, |ui| {
             egui::ComboBox::from_id_salt((edit.view_scope, edit.tag_key, path, "enum"))
                 .width(240.0)
@@ -2380,23 +2956,59 @@ pub(super) fn draw_foundation_enum_row(
     });
 }
 
-pub(super) fn foundation_label_cell(ui: &mut Ui, text: &str) {
+pub(super) fn foundation_label_cell(ui: &mut Ui, text: &str, help: Option<&str>) {
     let width = FOUNDATION_LABEL_WIDTH;
     let height = 24.0;
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+    // Reserve a gutter for the "?" documentation cue. Foundation always reserves
+    // the space (the cue is Hidden, not Collapsed, when absent) so field names
+    // stay aligned whether or not a field has a doc string.
+    let gutter = 11.0;
+    if help.is_some() {
+        // The cue: a bold blue "?" left of the name (Foundation uses #3DA1CC).
+        ui.painter().text(
+            rect.left_center() + Vec2::new(2.0, 0.0),
+            Align2::LEFT_CENTER,
+            "?",
+            bold_font(12.5),
+            Color32::from_rgb(61, 161, 204),
+        );
+    }
+    let shown = truncate_for_cell(text, width - gutter - 4.0);
+    let truncated = shown != text;
     ui.painter().text(
-        rect.left_center() + Vec2::new(4.0, 0.0),
+        rect.left_center() + Vec2::new(gutter, 0.0),
         Align2::LEFT_CENTER,
-        truncate_for_cell(text, width - 6.0),
+        shown,
         FontId::proportional(12.5),
         text_dark(),
     );
-    if response.hovered() && text.len() > 34 {
-        response.on_hover_text(text);
+    // Hovering the name (or the cue) shows the field documentation (prefixed with
+    // the full name when the displayed label was truncated).
+    let tip = match (help, truncated) {
+        (Some(help), true) => Some(format!("{text}\n\n{help}")),
+        (Some(help), false) => Some(help.to_owned()),
+        (None, true) => Some(text.to_owned()),
+        (None, false) => None,
+    };
+    if let Some(tip) = tip {
+        response.on_hover_text(tip);
     }
 }
 
 pub(super) fn foundation_input_cell(ui: &mut Ui, text: &str, width: f32) {
+    foundation_input_cell_colored(ui, text, width, text_dark(), None);
+}
+
+/// Like [`foundation_input_cell`] but with an explicit text color and an
+/// optional hover tooltip override (used to flag missing tag references in red).
+pub(super) fn foundation_input_cell_colored(
+    ui: &mut Ui,
+    text: &str,
+    width: f32,
+    color: Color32,
+    hover: Option<&str>,
+) {
     let height = 24.0;
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
     ui.painter().rect_filled(rect, 0.0, foundation_input());
@@ -2407,10 +3019,10 @@ pub(super) fn foundation_input_cell(ui: &mut Ui, text: &str, width: f32) {
         Align2::LEFT_CENTER,
         truncate_for_cell(text, width - 10.0),
         FontId::proportional(12.5),
-        text_dark(),
+        color,
     );
     if response.hovered() {
-        response.on_hover_text(text);
+        response.on_hover_text(hover.unwrap_or(text));
     }
 }
 
@@ -2566,6 +3178,75 @@ pub(super) fn foundation_editable_component_parts(
     }
 }
 
+/// Export a block's elements as tab-separated rows (header = leaf scalar field
+/// names; one row per element). Nested block/struct fields are omitted (flat
+/// export). Tabs/newlines in values are flattened to spaces so columns align.
+pub(super) fn block_to_tsv(block: &TagBlock<'_>, names: &TagNameIndex) -> String {
+    elements_to_tsv(block.len(), names, |index| block.element(index))
+}
+
+/// TSV export for a fixed-size array (read-only — arrays have no clipboard
+/// snapshot, but their values can still be copied out).
+pub(super) fn array_to_tsv(array: &blam_tags::TagArray<'_>, names: &TagNameIndex) -> String {
+    elements_to_tsv(array.len(), names, |index| array.element(index))
+}
+
+/// Shared TSV body: header row of leaf scalar field names, one row per element.
+fn elements_to_tsv<'a>(
+    count: usize,
+    names: &TagNameIndex,
+    get: impl Fn(usize) -> Option<TagStruct<'a>>,
+) -> String {
+    let Some(first) = get(0) else {
+        return String::new();
+    };
+    let is_leaf = |field: &TagField<'_>| {
+        field.as_block().is_none() && field.as_struct().is_none() && field.value().is_some()
+    };
+    let columns: Vec<String> = first
+        .fields()
+        .filter(is_leaf)
+        .map(|field| clean_field_name(field.name()))
+        .collect();
+    if columns.is_empty() {
+        return String::new();
+    }
+    let mut out = columns.join("\t");
+    for index in 0..count {
+        out.push('\n');
+        if let Some(element) = get(index) {
+            let cells: Vec<String> = element
+                .fields()
+                .filter(is_leaf)
+                .filter_map(|field| {
+                    field.value().map(|value| {
+                        format_foundation_scalar_value(names, &value)
+                            .replace(['\t', '\n'], " ")
+                    })
+                })
+                .collect();
+            out.push_str(&cells.join("\t"));
+        }
+    }
+    out
+}
+
+/// Leaf scalar columns of a block element as `(clean name, full stored name)`
+/// pairs — the inverse of [`block_to_tsv`]'s header, used by TSV import to map a
+/// pasted column header back to the field path segment to write.
+pub(super) fn block_leaf_columns(block: &TagBlock<'_>) -> Vec<(String, String)> {
+    let Some(first) = block.element(0) else {
+        return Vec::new();
+    };
+    first
+        .fields()
+        .filter(|field| {
+            field.as_block().is_none() && field.as_struct().is_none() && field.value().is_some()
+        })
+        .map(|field| (clean_field_name(field.name()), field.name().to_owned()))
+        .collect()
+}
+
 pub(super) fn format_foundation_scalar_value(names: &TagNameIndex, value: &TagFieldData) -> String {
     match value {
         TagFieldData::Angle(v)
@@ -2625,6 +3306,34 @@ pub(super) fn is_hidden_non_expert_value(value: &TagFieldData, expert_mode: bool
 mod tests {
     use super::*;
 
+    #[test]
+    fn block_index_value_reads_all_variants() {
+        use blam_tags::TagFieldData::*;
+        assert_eq!(block_index_value(&CharBlockIndex(-1)), Some(-1));
+        assert_eq!(block_index_value(&ShortBlockIndex(5)), Some(5));
+        assert_eq!(block_index_value(&LongBlockIndex(42)), Some(42));
+        assert_eq!(block_index_value(&CustomShortBlockIndex(3)), Some(3));
+        // Non-block-index values don't read as a block index.
+        assert_eq!(block_index_value(&LongInteger(7)), None);
+    }
+
+    #[test]
+    fn parent_block_path_and_breadcrumb() {
+        assert_eq!(
+            parent_block_path("regions[0]/permutations").as_deref(),
+            Some("regions")
+        );
+        assert_eq!(parent_block_path("a/b/c").as_deref(), Some("a/b"));
+        assert_eq!(parent_block_path("a/b[3]").as_deref(), Some("a"));
+        assert_eq!(parent_block_path("regions"), None);
+
+        assert_eq!(
+            breadcrumb_for_path("regions[0]/permutations"),
+            "regions › permutations"
+        );
+        assert_eq!(breadcrumb_for_path("variants"), "variants");
+    }
+
     fn with_test_edit_context(assertion: impl FnOnce(&FieldEditContext<'_>)) {
         let definitions_root = locate_definitions_root();
         let mut buffers = HashMap::new();
@@ -2642,10 +3351,12 @@ mod tests {
         let mut color_request = None;
         let mut function_request = None;
         let mut block_clip_request = None;
+        let mut tsv_paste_request = None;
         let edit = FieldEditContext {
             view_scope: "test",
             tag_key: "test",
             group_tag: parse_group_tag("jpt!").unwrap(),
+            root: None,
             game: Some("halo3_mcc"),
             definitions_root: Some(definitions_root.as_path()),
             definition_group_name: Some("damage_effect"),
@@ -2667,6 +3378,8 @@ mod tests {
             color_request: &mut color_request,
             function_request: &mut function_request,
             block_clipboard: None,
+            docs: None,
+            tsv_paste_request: &mut tsv_paste_request,
             block_clip_request: &mut block_clip_request,
             field_filter: None,
         };
@@ -2674,19 +3387,11 @@ mod tests {
     }
 
     #[test]
-    fn damage_effect_screen_flash_explanation_comes_from_definition_json() {
-        with_test_edit_context(|edit| {
-            let text = explanation_text_for_field(
-                "screen flash",
-                "player responses[0]/screen flash",
-                edit,
-            )
-            .unwrap();
-
-            assert!(text.contains("There are seven screen flash types"));
-            assert!(text.contains("LIGHTEN"));
-            assert!(text.contains("DST'"));
-        });
+    fn screen_flash_explanation_fallback_present() {
+        let text = known_explanation_text("screen flash").unwrap();
+        assert!(text.contains("There are seven screen flash types"));
+        assert!(text.contains("LIGHTEN"));
+        assert!(text.contains("DST'"));
     }
 
     #[test]
@@ -2791,3 +3496,4 @@ pub(super) fn draw_resource(
         },
     );
 }
+

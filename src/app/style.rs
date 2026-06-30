@@ -41,6 +41,10 @@ pub(super) fn foundation_visuals() -> egui::Visuals {
     visuals
 }
 
+/// Named family used for bold headers (egui has no font-weight API — bold is a
+/// separate font). Falls back to the regular family when no bold font is found.
+pub(super) const FOUNDATION_BOLD: &str = "foundation_bold";
+
 pub(super) fn foundation_fonts() -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
     for path in [
@@ -60,7 +64,52 @@ pub(super) fn foundation_fonts() -> FontDefinitions {
             break;
         }
     }
+
+    // Bold face for headers (Foundation uses FontWeight=Bold). Try common
+    // system bold fonts across platforms; gracefully degrade to the regular
+    // family if none are present so the named family is always valid.
+    let bold_loaded = [
+        r"C:\Windows\Fonts\segoeuib.ttf",
+        r"C:\Windows\Fonts\tahomabd.ttf",
+        r"C:\Windows\Fonts\arialbd.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Tahoma Bold.ttf",
+        "/Library/Fonts/Arial Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ]
+    .iter()
+    .any(|path| match std::fs::read(path) {
+        Ok(bytes) => {
+            fonts
+                .font_data
+                .insert(FOUNDATION_BOLD.to_owned(), FontData::from_owned(bytes));
+            true
+        }
+        Err(_) => false,
+    });
+
+    let regular = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    let mut bold_family = Vec::new();
+    if bold_loaded {
+        bold_family.push(FOUNDATION_BOLD.to_owned());
+    }
+    bold_family.extend(regular); // glyph fallback (and the whole family if no bold)
     fonts
+        .families
+        .insert(FontFamily::Name(FOUNDATION_BOLD.into()), bold_family);
+
+    fonts
+}
+
+/// A bold [`FontId`] at `size`, for headers. Renders bold where a system bold
+/// font was found, otherwise regular weight.
+pub(super) fn bold_font(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(FOUNDATION_BOLD.into()))
 }
 
 pub(super) fn foundation_style() -> egui::Style {

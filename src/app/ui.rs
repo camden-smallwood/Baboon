@@ -154,6 +154,28 @@ mod tests {
     }
 }
 
+/// A clickable tag entry row in the Content Explorer. Returns true on click.
+fn explorer_entry_row(ui: &mut Ui, entry: &TagEntry) -> bool {
+    ui.add(
+        egui::Label::new(
+            RichText::new(entry.display_path.replace('\\', "/")).color(text_dark()),
+        )
+        .sense(Sense::click()),
+    )
+    .on_hover_text("Click to navigate here")
+    .clicked()
+}
+
+/// Blend `base` toward `accent` by `t` (0..1). Used for the unsaved-tab tint.
+fn tint_toward(base: Color32, accent: Color32, t: f32) -> Color32 {
+    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+    Color32::from_rgb(
+        lerp(base.r(), accent.r()),
+        lerp(base.g(), accent.g()),
+        lerp(base.b(), accent.b()),
+    )
+}
+
 fn tab_label_width(ui: &Ui, label: &str, min_width: f32, max_width: f32) -> f32 {
     let width = label.chars().count() as f32 * 7.0 + ui.spacing().button_padding.x * 2.0;
     width.clamp(min_width, max_width)
@@ -178,6 +200,12 @@ impl Baboon {
             {
                 query.clear();
             }
+            ui.separator();
+            ui.checkbox(&mut self.field_search_passive, "Highlight")
+                .on_hover_text(
+                    "Passive: highlight matches and keep them open without \
+                     collapsing the rest. Off: collapse to matches only.",
+                );
         });
         ui.add_space(4.0);
     }
@@ -249,6 +277,753 @@ impl Baboon {
             ui.menu_button("M", add_commands)
                 .response
                 .on_hover_text("Run monitor command");
+        }
+    }
+
+    /// Per-tag keyword chips (add via Enter/Add, remove via the chip button).
+    /// Keywords live in an external sidecar, not the tag binary.
+    fn draw_keyword_bar(&mut self, ui: &mut Ui, tag_key: &str) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Keywords:").color(subtle_dark()));
+            let existing = self.keywords.keywords(tag_key).to_vec();
+            let mut remove: Option<String> = None;
+            for keyword in &existing {
+                if ui
+                    .small_button(format!("{keyword}  ✕"))
+                    .on_hover_text("Remove keyword")
+                    .clicked()
+                {
+                    remove = Some(keyword.clone());
+                }
+            }
+            if let Some(keyword) = remove {
+                self.keywords.remove(tag_key, &keyword);
+            }
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.keyword_input)
+                    .hint_text("add keyword")
+                    .desired_width(120.0),
+            );
+            let submitted =
+                resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (ui.button("Add").clicked() || submitted) && !self.keyword_input.trim().is_empty() {
+                self.keywords.add(tag_key, &self.keyword_input);
+                self.keyword_input.clear();
+            }
+        });
+        ui.add_space(4.0);
+    }
+
+    /// Small query window for the background field-value search. Results land in
+    /// the shared results window via `FieldValueSearchFinished`.
+    /// Rename / move a tag with reference fix-up. The referrer list is the
+    /// preview; "Apply" moves the file and rewrites every referencing tag.
+    fn draw_rename_tag_window(&mut self, ctx: &egui::Context) {
+        if self.rename_tag.is_none() {
+            return;
+        }
+        let mut open = true;
+        let mut do_apply = false;
+        let mut cancel = false;
+        {
+            let state = self.rename_tag.as_mut().expect("checked above");
+            egui::Window::new("Rename / Move Tag")
+                .id(egui::Id::new("rename_tag"))
+                .open(&mut open)
+                .default_width(560.0)
+                .show(ctx, |ui| {
+                    ui.label(RichText::new("Current path").color(subtle_dark()).small());
+                    ui.label(RichText::new(&state.old_display).color(text_dark()).monospace());
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("New path (relative, no extension)")
+                            .color(subtle_dark())
+                            .small(),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.new_path_input)
+                                .desired_width(430.0)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        ui.label(
+                            RichText::new(format!(".{}", state.extension)).color(subtle_dark()),
+                        );
+                    });
+                    ui.add_space(8.0);
+                    if state.referrers_unavailable {
+                        ui.label(
+                            RichText::new(
+                                "Reference index unavailable — references are still rewritten on \
+                                 apply, but can't be previewed here.",
+                            )
+                            .color(subtle_dark()),
+                        );
+                    } else if state.referrers.is_empty() {
+                        ui.label(
+                            RichText::new("No other tags reference this tag.")
+                                .color(subtle_dark()),
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} referring tag(s) will be updated:",
+                                state.referrers.len()
+                            ))
+                            .color(text_dark()),
+                        );
+                        egui::ScrollArea::vertical()
+                            .id_salt("rename_referrers")
+                            .max_height(220.0)
+                            .show(ui, |ui| {
+                                for referrer in &state.referrers {
+                                    ui.label(
+                                        RichText::new(referrer).color(subtle_dark()).small(),
+                                    );
+                                }
+                            });
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                !state.new_path_input.trim().is_empty(),
+                                egui::Button::new("Apply"),
+                            )
+                            .on_hover_text("Move the file on disk and rewrite all references")
+                            .clicked()
+                        {
+                            do_apply = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+        }
+        if do_apply {
+            // begin_rename_tag clears `rename_tag` on success; on a validation
+            // error it leaves the dialog open with a status message.
+            self.begin_rename_tag();
+        }
+        if cancel || !open {
+            self.rename_tag = None;
+        }
+    }
+
+    /// TSV import window: the user pastes tab-separated rows (header = field
+    /// names) and applies them onto the target block's existing elements.
+    fn draw_tsv_paste_window(&mut self, ctx: &egui::Context) {
+        if self.tsv_paste.is_none() {
+            return;
+        }
+        let mut open = true;
+        let mut do_apply = false;
+        {
+            let paste = self.tsv_paste.as_mut().expect("checked above");
+            egui::Window::new(format!("Paste TSV → {}", paste.block_label))
+                .id(egui::Id::new("tsv_paste"))
+                .open(&mut open)
+                .default_width(560.0)
+                .show(ctx, |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "Paste tab-separated rows (first row = field names) to overwrite \
+                             this block's {} element(s), cell by cell. Extra rows are ignored — \
+                             add elements first if you need more.",
+                            paste.element_count
+                        ))
+                        .color(subtle_dark()),
+                    );
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut paste.text)
+                                .desired_rows(12)
+                                .desired_width(f32::INFINITY)
+                                .font(egui::TextStyle::Monospace)
+                                .hint_text("paste TSV here (Ctrl+V)"),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                !paste.text.trim().is_empty(),
+                                egui::Button::new("Apply"),
+                            )
+                            .clicked()
+                        {
+                            do_apply = true;
+                        }
+                        if let Some(status) = &paste.status {
+                            ui.label(RichText::new(status).color(subtle_dark()));
+                        }
+                    });
+                });
+        }
+        if do_apply {
+            self.apply_tsv_paste();
+        }
+        if !open {
+            self.tsv_paste = None;
+        }
+    }
+
+    fn draw_field_value_search_window(&mut self, ctx: &egui::Context) {
+        if !self.field_value_search_open {
+            return;
+        }
+        let mut open = true;
+        let mut do_search = false;
+        let mut do_build = false;
+        egui::Window::new("Search Field Values")
+            .id(egui::Id::new("field_value_search"))
+            .open(&mut open)
+            .default_width(400.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Find tags whose field values contain text — strings, string IDs, tag \
+                         references, and enum names.",
+                    )
+                    .color(subtle_dark()),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let response = ui.add_enabled(
+                        !self.field_value_searching,
+                        egui::TextEdit::singleline(&mut self.field_value_query)
+                            .hint_text("value to find")
+                            .desired_width(240.0),
+                    );
+                    let submitted = response.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if self.field_value_searching {
+                        ui.spinner();
+                        ui.label(RichText::new("searching…").color(subtle_dark()));
+                    } else if ui.button("Search").clicked() || submitted {
+                        do_search = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("group").color(subtle_dark()).small());
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.field_value_group)
+                            .hint_text("any (e.g. weap / weapon)")
+                            .desired_width(180.0),
+                    )
+                    .on_hover_text("Optional: limit the search to a tag group (four-CC or name).");
+                });
+                ui.add_space(4.0);
+                let indexed = self.field_index.is_ready_for(self.source_generation);
+                ui.horizontal(|ui| {
+                    if indexed {
+                        ui.label(
+                            RichText::new("● indexed — searches are instant")
+                                .color(Color32::from_rgb(120, 170, 90))
+                                .small(),
+                        );
+                    } else if self.field_index.is_building() {
+                        ui.spinner();
+                        ui.label(
+                            RichText::new("building index…").color(subtle_dark()).small(),
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new("not indexed — first search scans live").color(subtle_dark()).small(),
+                        );
+                        if ui.small_button("Build index").clicked() {
+                            do_build = true;
+                        }
+                    }
+                });
+            });
+        if do_search && !self.field_value_query.trim().is_empty() {
+            self.begin_field_value_search(ctx.clone());
+        }
+        if do_build {
+            self.begin_build_field_index(ctx.clone());
+        }
+        self.field_value_search_open = open;
+    }
+
+    /// Window listing all keywords (with tag counts); clicking one shows the
+    /// tags that carry it in the shared results window.
+    fn draw_keyword_chooser_window(&mut self, ctx: &egui::Context) {
+        if !self.keyword_chooser_open {
+            return;
+        }
+        let mut open = true;
+        let mut chosen: Option<String> = None;
+        let all = self.keywords.all_keywords();
+        egui::Window::new("Keywords")
+            .id(egui::Id::new("keyword_chooser"))
+            .open(&mut open)
+            .default_width(280.0)
+            .show(ctx, |ui| {
+                if all.is_empty() {
+                    ui.label(
+                        RichText::new("No keywords yet — add them on a tag's Keywords bar.")
+                            .color(subtle_dark()),
+                    );
+                }
+                egui::ScrollArea::vertical()
+                    .max_height(420.0)
+                    .show(ui, |ui| {
+                        for (keyword, count) in &all {
+                            if ui
+                                .add(
+                                    egui::Label::new(
+                                        RichText::new(format!("{keyword}  ({count})"))
+                                            .color(text_dark()),
+                                    )
+                                    .sense(Sense::click()),
+                                )
+                                .on_hover_text("Show tags with this keyword")
+                                .clicked()
+                            {
+                                chosen = Some(keyword.clone());
+                            }
+                        }
+                    });
+            });
+        if let Some(keyword) = chosen {
+            self.show_tags_with_keyword(&keyword);
+        }
+        self.keyword_chooser_open = open;
+    }
+
+    /// Reference-graph navigator: parents (referenced by) on the left, children
+    /// (references) on the right, with the focused tag and back/forward history.
+    fn draw_content_explorer_window(&mut self, ctx: &egui::Context) {
+        if self.content_explorer.is_none() {
+            return;
+        }
+        enum ExplorerAct {
+            Navigate(TagEntry),
+            Back,
+            Forward,
+            Open(String),
+            Reveal(String),
+        }
+        let mut open = true;
+        let mut act: Option<ExplorerAct> = None;
+        let mut filter = self
+            .content_explorer
+            .as_ref()
+            .map(|explorer| explorer.filter.clone())
+            .unwrap_or_default();
+        {
+            let explorer = self.content_explorer.as_ref().expect("checked above");
+            egui::Window::new("Content Explorer")
+                .id(egui::Id::new("content_explorer"))
+                .open(&mut open)
+                .default_width(720.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(!explorer.back.is_empty(), egui::Button::new("← Back"))
+                            .clicked()
+                        {
+                            act = Some(ExplorerAct::Back);
+                        }
+                        if ui
+                            .add_enabled(
+                                !explorer.forward.is_empty(),
+                                egui::Button::new("Forward →"),
+                            )
+                            .clicked()
+                        {
+                            act = Some(ExplorerAct::Forward);
+                        }
+                        ui.separator();
+                        if ui.button("Open in editor").clicked() {
+                            act = Some(ExplorerAct::Open(explorer.focus.key.clone()));
+                        }
+                        if ui.button("Reveal in browser").clicked() {
+                            act = Some(ExplorerAct::Reveal(explorer.focus.key.clone()));
+                        }
+                        ui.separator();
+                        ui.add(
+                            egui::TextEdit::singleline(&mut filter)
+                                .hint_text("filter")
+                                .desired_width(140.0),
+                        );
+                    });
+                    ui.separator();
+                    ui.label(
+                        RichText::new(explorer.focus.display_path.replace('\\', "/"))
+                            .strong()
+                            .color(text_dark()),
+                    );
+                    if explorer.index_unavailable {
+                        ui.label(
+                            RichText::new(
+                                "Reference index unavailable — load a loose-folder source and \
+                                 let it finish scanning.",
+                            )
+                            .color(subtle_dark()),
+                        );
+                    }
+                    ui.separator();
+                    let filter_lower = filter.trim().to_ascii_lowercase();
+                    let matches = |entry: &TagEntry| {
+                        filter_lower.is_empty()
+                            || entry
+                                .display_path
+                                .to_ascii_lowercase()
+                                .contains(&filter_lower)
+                    };
+                    let parents: Vec<&TagEntry> =
+                        explorer.parents.iter().filter(|e| matches(e)).collect();
+                    let children: Vec<&TagEntry> =
+                        explorer.children.iter().filter(|e| matches(e)).collect();
+                    let count_label = |shown: usize, total: usize| {
+                        if shown == total {
+                            format!("({total})")
+                        } else {
+                            format!("({shown}/{total})")
+                        }
+                    };
+                    ui.columns(2, |cols| {
+                        cols[0].label(
+                            RichText::new(format!(
+                                "Referenced by {}",
+                                count_label(parents.len(), explorer.parents.len())
+                            ))
+                            .strong()
+                            .color(text_dark()),
+                        );
+                        egui::ScrollArea::vertical()
+                            .id_salt("ce_parents")
+                            .max_height(380.0)
+                            .show(&mut cols[0], |ui| {
+                                if parents.is_empty() {
+                                    ui.label(RichText::new("(none)").color(subtle_dark()));
+                                }
+                                for entry in &parents {
+                                    if explorer_entry_row(ui, entry) {
+                                        act = Some(ExplorerAct::Navigate((*entry).clone()));
+                                    }
+                                }
+                            });
+                        cols[1].label(
+                            RichText::new(format!(
+                                "References {}",
+                                count_label(children.len(), explorer.children.len())
+                            ))
+                            .strong()
+                            .color(text_dark()),
+                        );
+                        egui::ScrollArea::vertical()
+                            .id_salt("ce_children")
+                            .max_height(380.0)
+                            .show(&mut cols[1], |ui| {
+                                if children.is_empty() {
+                                    ui.label(RichText::new("(none)").color(subtle_dark()));
+                                }
+                                for entry in &children {
+                                    if explorer_entry_row(ui, entry) {
+                                        act = Some(ExplorerAct::Navigate((*entry).clone()));
+                                    }
+                                }
+                            });
+                    });
+                });
+        }
+        if let Some(explorer) = self.content_explorer.as_mut() {
+            explorer.filter = filter;
+        }
+        match act {
+            Some(ExplorerAct::Navigate(entry)) => self.content_explorer_navigate(entry),
+            Some(ExplorerAct::Back) => self.content_explorer_back(),
+            Some(ExplorerAct::Forward) => self.content_explorer_forward(),
+            Some(ExplorerAct::Open(key)) => self.select_entry(key, ctx.clone()),
+            Some(ExplorerAct::Reveal(key)) => self.reveal_in_browser(&key),
+            None => {}
+        }
+        if !open {
+            self.content_explorer = None;
+        }
+    }
+
+    /// Floating window listing the results of a tag query (find-references /
+    /// unreferenced). Clicking an entry opens it.
+    fn source_game(&self) -> Option<&str> {
+        self.source.as_ref().and_then(|source| source.game.as_deref())
+    }
+
+    fn source_tags_root(&self) -> Option<&std::path::Path> {
+        self.source.as_ref().and_then(|source| match &source.source {
+            TagSource::LooseFolder { root, .. } => Some(root.as_path()),
+            _ => None,
+        })
+    }
+
+    fn source_definitions_root(&self) -> Option<&std::path::Path> {
+        self.source.as_ref().and_then(|source| match &source.source {
+            TagSource::LooseFolder {
+                definitions_root, ..
+            } => Some(definitions_root.as_path()),
+            _ => None,
+        })
+    }
+
+    fn draw_tag_diff_window(&mut self, ctx: &egui::Context) {
+        let Some(mut state) = self.tag_diff.take() else {
+            return;
+        };
+        let a_group = self
+            .parsed_tags
+            .get(&state.a_key)
+            .map(|doc| doc.tag.group().tag);
+        let mut open = true;
+        let mut compute = false;
+        let mut browse = false;
+        egui::Window::new("Compare Tags")
+            .id(egui::Id::new("tag_diff_window"))
+            .open(&mut open)
+            .default_width(640.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("A:").strong().color(text_dark()));
+                    ui.monospace(state.a_key.replace('\\', "/"));
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("B:").strong().color(text_dark()));
+                    let selected = state
+                        .b_display
+                        .clone()
+                        .map(|k| k.replace('\\', "/"))
+                        .unwrap_or_else(|| "(open tag)".to_owned());
+                    egui::ComboBox::from_id_salt("tag_diff_b")
+                        .selected_text(selected)
+                        .width(380.0)
+                        .show_ui(ui, |ui| {
+                            let mut keys: Vec<&String> = self
+                                .parsed_tags
+                                .keys()
+                                .filter(|k| {
+                                    **k != state.a_key
+                                        && self.parsed_tags.get(*k).map(|d| d.tag.group().tag)
+                                            == a_group
+                                })
+                                .collect();
+                            keys.sort();
+                            for key in keys {
+                                if ui
+                                    .selectable_label(
+                                        state.b_key.as_deref() == Some(key.as_str()),
+                                        key.replace('\\', "/"),
+                                    )
+                                    .clicked()
+                                {
+                                    state.b_key = Some(key.clone());
+                                    state.b_display = Some(key.clone());
+                                    state.results = None;
+                                }
+                            }
+                        });
+                    if ui
+                        .add_enabled(state.b_key.is_some(), egui::Button::new("Compare"))
+                        .clicked()
+                    {
+                        compute = true;
+                    }
+                    if ui
+                        .button("Browse file…")
+                        .on_hover_text("Pick any tag of the same group from disk")
+                        .clicked()
+                    {
+                        browse = true;
+                    }
+                });
+                ui.label(
+                    RichText::new("Compares field-by-field against an open tab or a tag on disk.")
+                        .small()
+                        .color(subtle_dark()),
+                );
+
+                if let Some(results) = &state.results {
+                    ui.separator();
+                    if results.diffs.is_empty() {
+                        ui.label(RichText::new("No differences.").color(subtle_dark()));
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} differing field(s){}",
+                                    results.diffs.len(),
+                                    if results.truncated { " (capped)" } else { "" }
+                                ))
+                                .color(subtle_dark())
+                                .small(),
+                            );
+                            if ui
+                                .small_button("Copy")
+                                .on_hover_text("Copy the diff as tab-separated rows")
+                                .clicked()
+                            {
+                                let text = std::iter::once("field\tA\tB".to_owned())
+                                    .chain(
+                                        results
+                                            .diffs
+                                            .iter()
+                                            .map(|d| format!("{}\t{}\t{}", d.path, d.a, d.b)),
+                                    )
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                ui.output_mut(|output| output.copied_text = text);
+                            }
+                        });
+                        ui.separator();
+                        egui::ScrollArea::vertical().max_height(460.0).show(ui, |ui| {
+                            egui::Grid::new("tag_diff_grid")
+                                .num_columns(3)
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    for diff in &results.diffs {
+                                        ui.label(RichText::new(&diff.path).monospace().small());
+                                        ui.label(RichText::new(&diff.a).color(text_dark()));
+                                        ui.label(RichText::new(&diff.b).color(text_dark()));
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                    }
+                }
+            });
+
+        if compute {
+            if let Some(b_key) = state.b_key.clone() {
+                let names = TagNameIndex::default();
+                let diff = match (
+                    self.parsed_tags.get(&state.a_key),
+                    self.parsed_tags.get(&b_key),
+                ) {
+                    (Some(a), Some(b)) => Some(diff_tags(&a.tag, &b.tag, &names, 5000)),
+                    _ => None,
+                };
+                if let Some((diffs, truncated)) = diff {
+                    state.results = Some(TagDiffResults { diffs, truncated });
+                }
+            }
+        }
+        if browse {
+            if let Some(group) = a_group {
+                let ext = group_tag_to_extension(group).unwrap_or("");
+                let mut dialog = rfd::FileDialog::new().set_title("Pick tag B to compare");
+                if !ext.is_empty() {
+                    dialog = dialog.add_filter(ext, &[ext]);
+                }
+                if let Some(root) = self.source_tags_root() {
+                    dialog = dialog.set_directory(root);
+                }
+                if let Some(path) = dialog.pick_file() {
+                    let game = self.source_game();
+                    let definitions_root = self.source_definitions_root();
+                    match crate::source::read_tag_at_path(&path, game, definitions_root, group) {
+                        Ok(b_tag) => {
+                            if let Some(a) = self.parsed_tags.get(&state.a_key) {
+                                let names = TagNameIndex::default();
+                                let (diffs, truncated) = diff_tags(&a.tag, &b_tag, &names, 5000);
+                                state.b_key = None;
+                                state.b_display = Some(path.display().to_string());
+                                state.results = Some(TagDiffResults { diffs, truncated });
+                            }
+                        }
+                        Err(error) => {
+                            self.status = format!("Compare: could not load {}: {error}", path.display());
+                        }
+                    }
+                }
+            }
+        }
+        if open {
+            self.tag_diff = Some(state);
+        }
+    }
+
+    fn draw_query_results_window(&mut self, ctx: &egui::Context) {
+        let Some(results) = self.query_results.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut to_open: Option<String> = None;
+        let mut to_reveal: Option<String> = None;
+        egui::Window::new(&results.title)
+            .id(egui::Id::new("tag_query_results"))
+            .open(&mut open)
+            .default_width(440.0)
+            .show(ctx, |ui| {
+                if let Some(note) = &results.note {
+                    ui.label(RichText::new(note).color(subtle_dark()));
+                }
+                if !results.entries.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("{} tag(s)", results.entries.len()))
+                                .color(subtle_dark())
+                                .small(),
+                        );
+                        if ui
+                            .small_button("Copy paths")
+                            .on_hover_text("Copy all result tag paths (one per line)")
+                            .clicked()
+                        {
+                            let text = results
+                                .entries
+                                .iter()
+                                .map(|entry| entry.display_path.replace('\\', "/"))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            ui.output_mut(|output| output.copied_text = text);
+                        }
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .max_height(460.0)
+                        .show(ui, |ui| {
+                            for (index, entry) in results.entries.iter().enumerate() {
+                                let path = entry.display_path.replace('\\', "/");
+                                let label = match results.annotations.get(index) {
+                                    Some(annotation) => format!("{annotation}  —  {path}"),
+                                    None => path,
+                                };
+                                let row = ui
+                                    .add(
+                                        egui::Label::new(
+                                            RichText::new(label).color(text_dark()),
+                                        )
+                                        .sense(Sense::click()),
+                                    )
+                                    .on_hover_text("Click to open · right-click to reveal");
+                                if row.clicked() {
+                                    to_open = Some(entry.key.clone());
+                                }
+                                row.context_menu(|ui| {
+                                    if ui.button("Open").clicked() {
+                                        to_open = Some(entry.key.clone());
+                                        ui.close_menu();
+                                    }
+                                    if ui.button("Reveal in browser").clicked() {
+                                        to_reveal = Some(entry.key.clone());
+                                        ui.close_menu();
+                                    }
+                                });
+                            }
+                        });
+                }
+            });
+        if let Some(key) = to_open {
+            self.select_entry(key, ctx.clone());
+        }
+        if let Some(key) = to_reveal {
+            self.reveal_in_browser(&key);
+        }
+        // Keep the window's results until it is closed.
+        if open {
+            self.query_results = Some(results);
         }
     }
 
@@ -841,6 +1616,11 @@ impl Baboon {
                     String::new()
                 }
             });
+        // Inline validation: a required parameter left empty is flagged before
+        // Run (the Run button is also disabled). Enum args always have a value.
+        let is_invalid = arg.required
+            && arg.kind != ToolCommandArgKind::Enum
+            && value.trim().is_empty();
         let mut browse_clicked = false;
         ui.horizontal(|ui| {
             ui.set_min_height(24.0);
@@ -867,11 +1647,13 @@ impl Baboon {
                         });
                 }
                 _ => {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut value)
-                            .desired_width(300.0)
-                            .font(egui::TextStyle::Monospace),
-                    );
+                    let mut edit = egui::TextEdit::singleline(&mut value)
+                        .desired_width(300.0)
+                        .font(egui::TextStyle::Monospace);
+                    if is_invalid {
+                        edit = edit.text_color(Color32::from_rgb(190, 70, 54));
+                    }
+                    ui.add(edit);
                     if matches!(
                         arg.kind,
                         ToolCommandArgKind::PathData
@@ -882,6 +1664,13 @@ impl Baboon {
                         browse_clicked = true;
                     }
                 }
+            }
+            if is_invalid {
+                ui.label(
+                    RichText::new("required")
+                        .small()
+                        .color(Color32::from_rgb(190, 70, 54)),
+                );
             }
         });
         if browse_clicked && let Some(path) = self.pick_tool_command_path(arg.kind) {
@@ -1257,6 +2046,16 @@ impl eframe::App for Baboon {
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::S)) {
             self.save_current_tag();
         }
+        // Undo: Ctrl+Z. Redo: Ctrl+Shift+Z or Ctrl+Y.
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::Z)) {
+            self.undo_current_tag();
+        }
+        if ctx.input_mut(|input| {
+            input.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Z)
+        }) || ctx.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::Y))
+        {
+            self.redo_current_tag();
+        }
 
         egui::TopBottomPanel::top("menu")
             .frame(Frame::none().fill(menu_bar()).inner_margin(egui::Margin {
@@ -1387,6 +2186,88 @@ impl eframe::App for Baboon {
                             ui.close_menu();
                         }
                     });
+                    ui.menu_button("Edit", |ui| {
+                        if ui
+                            .add_enabled(
+                                self.can_undo_current(),
+                                egui::Button::new("Undo    Ctrl+Z"),
+                            )
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            self.undo_current_tag();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.can_redo_current(),
+                                egui::Button::new("Redo    Ctrl+Shift+Z"),
+                            )
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            self.redo_current_tag();
+                        }
+                    });
+                    ui.menu_button("Tools", |ui| {
+                        if ui
+                            .add_enabled(
+                                self.selected_key.is_some(),
+                                egui::Button::new("Find References to Current Tag"),
+                            )
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            if let Some(key) = self.selected_key.clone() {
+                                self.show_references_for(&key);
+                            }
+                        }
+                        if ui
+                            .add_enabled(
+                                self.selected_key.is_some(),
+                                egui::Button::new("Explore References to Current Tag..."),
+                            )
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            if let Some(key) = self.selected_key.clone() {
+                                self.open_content_explorer(&key);
+                            }
+                        }
+                        if ui.button("Find Unreferenced Tags...").clicked() {
+                            ui.close_menu();
+                            self.show_unreferenced_tags();
+                        }
+                        if ui.button("List Scenario Map IDs...").clicked() {
+                            ui.close_menu();
+                            self.show_map_ids();
+                        }
+                        if ui.button("Search Field Values...").clicked() {
+                            ui.close_menu();
+                            self.field_value_search_open = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                self.selected_key.is_some(),
+                                egui::Button::new("Compare Current Tag With..."),
+                            )
+                            .clicked()
+                        {
+                            ui.close_menu();
+                            if let Some(key) = self.selected_key.clone() {
+                                self.tag_diff = Some(TagDiffState {
+                                    a_key: key,
+                                    b_key: None,
+                                    b_display: None,
+                                    results: None,
+                                });
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("Browse Keywords...").clicked() {
+                            ui.close_menu();
+                            self.keyword_chooser_open = true;
+                        }
+                    });
                     ui.menu_button("View", |ui| {
                         if ui
                             .selectable_label(self.browser_mode == BrowserMode::Folders, "Folders")
@@ -1405,6 +2286,18 @@ impl eframe::App for Baboon {
                             self.browser_mode = BrowserMode::Groups;
                             ui.close_menu();
                         }
+                        ui.separator();
+                        ui.menu_button(format!("Sort by: {}", self.browser_sort.label()), |ui| {
+                            for option in BrowserSort::ALL {
+                                if ui
+                                    .selectable_label(self.browser_sort == option, option.label())
+                                    .clicked()
+                                {
+                                    self.browser_sort = option;
+                                    ui.close_menu();
+                                }
+                            }
+                        });
                         ui.separator();
                         ui.checkbox(&mut self.show_browser_prefixes, "Show [tag]/[folder]");
                         ui.checkbox(&mut self.show_block_sizes, "Show block sizes");
@@ -1708,6 +2601,13 @@ impl eframe::App for Baboon {
                                 .desired_width(f32::INFINITY),
                         );
                     });
+                    if let Some(warning) = browser::browser_filter_warning(&self.filter) {
+                        ui.label(
+                            RichText::new(warning)
+                                .small()
+                                .color(Color32::from_rgb(184, 134, 11)),
+                        );
+                    }
                     if prev_filter_empty
                         && !self.filter.is_empty()
                         && matches!(source.source, TagSource::LooseFolder { .. })
@@ -1727,6 +2627,14 @@ impl eframe::App for Baboon {
                     // scan) so every tag is visible, not just visited folders.
                     let has_all = !source.all_entries.is_empty();
                     let groups_mode = matches!(mode, BrowserMode::Groups);
+                    // One-shot "reveal in tree" request (force-open ancestors +
+                    // scroll). Borrowed into the Copy `Reveal` for the draw.
+                    let reveal_owned = self.reveal_target.take();
+                    let reveal = reveal_owned.as_ref().map(|request| Reveal {
+                        key: request.key.as_str(),
+                        remaining: request.ancestors.as_slice(),
+                    });
+                    let sort = self.browser_sort;
                     let action = if !filter.is_empty() {
                         // Active search: render a *pruned* tree containing only
                         // the matching tags, with folders collapsed so the user
@@ -1780,6 +2688,8 @@ impl eframe::App for Baboon {
                                         show_prefixes,
                                         double_click_to_open,
                                         groups_mode,
+                                        reveal,
+                                        sort,
                                     )
                                 })
                                 .inner
@@ -1803,6 +2713,8 @@ impl eframe::App for Baboon {
                                             show_prefixes,
                                             double_click_to_open,
                                             &mut status_update,
+                                            reveal,
+                                            sort,
                                         )
                                     } else {
                                         draw_tree(
@@ -1814,6 +2726,8 @@ impl eframe::App for Baboon {
                                             show_prefixes,
                                             double_click_to_open,
                                             false,
+                                            reveal,
+                                            sort,
                                         )
                                     }
                                 }
@@ -1840,6 +2754,8 @@ impl eframe::App for Baboon {
                                             show_prefixes,
                                             double_click_to_open,
                                             true,
+                                            reveal,
+                                            sort,
                                         )
                                     }
                                 }
@@ -1892,7 +2808,9 @@ impl eframe::App for Baboon {
 
                         let available_width = ui.available_width().max(120.0);
                         let row_gap = 3.0;
-                        let mut rows = Vec::<Vec<(String, String, bool, f32, u32)>>::new();
+                        // (key, label, active, dirty, label_width, group_tag)
+                        let mut rows =
+                            Vec::<Vec<(String, String, bool, bool, f32, u32)>>::new();
                         let mut row = Vec::new();
                         let mut row_width = 0.0;
 
@@ -1939,7 +2857,7 @@ impl eframe::App for Baboon {
                                 row_width += row_gap;
                             }
                             row_width += tab_width;
-                            row.push((key, label, active, label_width, entry.group_tag));
+                            row.push((key, label, active, dirty, label_width, entry.group_tag));
                         }
                         if !row.is_empty() {
                             rows.push(row);
@@ -1948,9 +2866,16 @@ impl eframe::App for Baboon {
                         for row in rows {
                             let row_response = ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = row_gap;
-                                for (key, label, active, label_width, group_tag) in row {
+                                for (key, label, active, dirty, label_width, group_tag) in row {
                                     let shown_label = truncate_for_cell(&label, label_width);
-                                    let fill = if active { menu_bar() } else { row_type() };
+                                    let base_fill = if active { menu_bar() } else { row_type() };
+                                    // Subtle amber tint flags tabs with unsaved edits
+                                    // (on top of the ● marker in the label).
+                                    let fill = if dirty {
+                                        tint_toward(base_fill, Color32::from_rgb(184, 134, 11), 0.20)
+                                    } else {
+                                        base_fill
+                                    };
                                     let tab_response = Frame::none()
                                         .fill(fill)
                                         .stroke(Stroke::new(1.0, grid_line()))
@@ -2046,6 +2971,7 @@ impl eframe::App for Baboon {
                 if let Some(entry) = self.selected_entry().cloned() {
                     let selected_key = entry.key.clone();
                     draw_entry_header(ui, &entry, &self.names);
+                    self.draw_keyword_bar(ui, &selected_key);
 
                     // "Search fields" collapses the editor to matching blocks.
                     // Not offered for shader/sound tags (their own surfaces).
@@ -2055,6 +2981,8 @@ impl eframe::App for Baboon {
                     }
 
                     let mut bitmap_reimport_request = None;
+                    // Documentation overlay (fetched before borrowing parsed_tags).
+                    let def_docs = self.def_docs_for_entry(&entry);
                     if let Some(doc) = self.parsed_tags.get_mut(&selected_key) {
                         let mut pending = Vec::new();
                         let mut block_ops = Vec::new();
@@ -2067,9 +2995,11 @@ impl eframe::App for Baboon {
                         let mut function_request = None;
                         let mut block_clip_request = None;
                         let mut bitmap_reimport = None;
+                        let mut tsv_paste_request = None;
                         let field_filter = compute_pending_field_filter(
                             &doc.tag,
                             supports_field_search,
+                            self.field_search_passive,
                             &selected_key,
                             &self.field_search,
                             &mut self.field_search_applied,
@@ -2078,6 +3008,7 @@ impl eframe::App for Baboon {
                             view_scope: "docked",
                             tag_key: &selected_key,
                             group_tag: entry.group_tag,
+                            root: Some(doc.tag.root()),
                             game: self
                                 .source
                                 .as_ref()
@@ -2117,6 +3048,8 @@ impl eframe::App for Baboon {
                             model_variant_ops: &mut model_variant_ops,
                             color_request: &mut color_request,
                             function_request: &mut function_request,
+                            docs: def_docs.as_deref(),
+                            tsv_paste_request: &mut tsv_paste_request,
                             block_clipboard: self.block_clipboard.as_ref(),
                             block_clip_request: &mut block_clip_request,
                             field_filter: field_filter.as_ref(),
@@ -2160,6 +3093,19 @@ impl eframe::App for Baboon {
                                 self.expert_mode,
                                 &mut edit_context,
                             );
+                        }
+                        // Snapshot for undo before a mutating batch. Coalesces
+                        // continuous edits into one entry; closes the window on
+                        // frames with no edits.
+                        if !pending.is_empty()
+                            || !block_ops.is_empty()
+                            || !shader_ops.is_empty()
+                            || !shader_param_ops.is_empty()
+                            || !model_variant_ops.is_empty()
+                        {
+                            doc.journal.begin_edit(&doc.tag, "Edit");
+                        } else {
+                            doc.journal.end_edit_window();
                         }
                         if let Some(status) =
                             apply_pending_edits(&mut doc.tag, pending, &mut doc.dirty)
@@ -2218,6 +3164,17 @@ impl eframe::App for Baboon {
                             );
                             self.block_clipboard = Some(clip);
                         }
+                        // "Paste TSV…" was chosen: open the import window.
+                        if let Some(req) = tsv_paste_request {
+                            self.tsv_paste = Some(TsvPasteState {
+                                tag_key: selected_key.clone(),
+                                block_path: req.block_path,
+                                block_label: req.block_label,
+                                element_count: req.element_count,
+                                text: String::new(),
+                                status: None,
+                            });
+                        }
                         bitmap_reimport_request = bitmap_reimport;
                     } else if self.loading_tags.contains(&selected_key) {
                         ui.label("Loading tag data...");
@@ -2236,7 +3193,15 @@ impl eframe::App for Baboon {
         self.draw_tool_commands_window(ctx);
         self.draw_new_tag_window(ctx);
         self.draw_about_window(ctx);
+        self.draw_query_results_window(ctx);
+        self.draw_tag_diff_window(ctx);
+        self.draw_content_explorer_window(ctx);
+        self.draw_keyword_chooser_window(ctx);
+        self.draw_field_value_search_window(ctx);
+        self.draw_tsv_paste_window(ctx);
+        self.draw_rename_tag_window(ctx);
         self.persist_prefs_if_changed();
+        self.keywords.save_if_dirty();
         self.draw_floating_tabs(ctx);
         self.handle_floating_tab_drop(ctx);
         if let Some(result) = draw_color_popup(
@@ -2248,44 +3213,55 @@ impl eframe::App for Baboon {
             match result {
                 ColorPopupResult::FieldEdit { tag_key, edit } => {
                     if let Some(doc) = self.parsed_tags.get_mut(&tag_key) {
+                        doc.journal.begin_edit(&doc.tag, "Edit color");
                         if let Some(status) =
                             apply_pending_edits(&mut doc.tag, vec![edit], &mut doc.dirty)
                         {
                             self.status = status;
                         }
+                        doc.journal.end_edit_window();
                     }
                 }
                 ColorPopupResult::ShaderOp { tag_key, op } => {
                     if let Some(doc) = self.parsed_tags.get_mut(&tag_key) {
+                        doc.journal.begin_edit(&doc.tag, "Shader edit");
                         if let Some(status) =
                             apply_shader_ops(&mut doc.tag, vec![op], &mut doc.dirty)
                         {
                             self.status = status;
                         }
+                        doc.journal.end_edit_window();
                     }
                 }
                 ColorPopupResult::ShaderParamOp { tag_key, op } => {
                     if let Some(doc) = self.parsed_tags.get_mut(&tag_key) {
+                        doc.journal.begin_edit(&doc.tag, "Shader parameter");
                         if let Some(status) =
                             apply_shader_param_ops(&mut doc.tag, vec![op], &mut doc.dirty)
                         {
                             self.status = status;
                         }
+                        doc.journal.end_edit_window();
                     }
                 }
                 ColorPopupResult::H2ShaderParamOp { tag_key, op } => {
                     if let Some(doc) = self.parsed_tags.get_mut(&tag_key) {
+                        doc.journal.begin_edit(&doc.tag, "Shader parameter");
                         if let Some(status) =
                             apply_h2_shader_param_ops(&mut doc.tag, vec![op], &mut doc.dirty)
                         {
                             self.status = status;
                         }
+                        doc.journal.end_edit_window();
                     }
                 }
             }
         }
         if let Some(batch) = draw_function_popup(ctx, &mut self.function_popup) {
             if let Some(doc) = self.parsed_tags.get_mut(&batch.tag_key) {
+                if !batch.edits.is_empty() || !batch.data_ops.is_empty() {
+                    doc.journal.begin_edit(&doc.tag, "Edit function");
+                }
                 if let Some(status) = apply_pending_edits(&mut doc.tag, batch.edits, &mut doc.dirty)
                 {
                     self.status = status;
@@ -2295,6 +3271,7 @@ impl eframe::App for Baboon {
                 {
                     self.status = status;
                 }
+                doc.journal.end_edit_window();
             }
         }
         self.handle_block_confirm(ctx);

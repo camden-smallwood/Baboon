@@ -5262,10 +5262,12 @@ pub(super) fn draw_shader_grid_row_readonly(
     let mut color_request = None;
     let mut function_request = None;
     let mut block_clip_request = None;
+    let mut tsv_paste_request = None;
     let mut ctx = FieldEditContext {
         view_scope: "readonly",
         tag_key: "",
         group_tag: 0,
+        root: None,
         game: None,
         definitions_root: None,
         definition_group_name: None,
@@ -5288,6 +5290,8 @@ pub(super) fn draw_shader_grid_row_readonly(
         color_request: &mut color_request,
         function_request: &mut function_request,
         block_clipboard: None,
+        docs: None,
+        tsv_paste_request: &mut tsv_paste_request,
         block_clip_request: &mut block_clip_request,
         field_filter: None,
     };
@@ -5478,6 +5482,79 @@ pub(super) fn draw_shader_flags_row(
     }
 }
 
+/// Accent painted on the left edge of a shader row whose value differs from the
+/// rmop/template default (Phase 4.1 "differs-from-default" indicator).
+const SHADER_MODIFIED_ACCENT: Color32 = Color32::from_rgb(224, 158, 62);
+
+/// Whether a row's value differs from its default. Colors render identical text
+/// (`"color: RGB"`) so are compared by hex; an unoverridden row shows the
+/// `"Override Default"` placeholder and never counts as modified.
+pub(super) fn row_differs_from_default(row: &ShaderGridRow) -> bool {
+    let Some(default) = row.default_cell.as_ref() else {
+        return false;
+    };
+    if row.value_cell.text == "Override Default" {
+        return false;
+    }
+    match (row.value_cell.color.as_ref(), default.color.as_ref()) {
+        (Some(value), Some(default)) => value.sc_hex != default.sc_hex,
+        _ => !shader_value_text_eq(&row.value_cell.text, &default.text),
+    }
+}
+
+/// A `PendingFieldEdit` that restores a row to its default, for simple
+/// scalar/int/string-id rows whose default is a plain (non-color, non-vector)
+/// value. `None` for colors/functions/bitmaps/etc. (no simple value reset).
+fn reset_edit_for_row(row: &ShaderGridRow) -> Option<PendingFieldEdit> {
+    let row_edit = row.edit.as_ref()?;
+    if !matches!(
+        row_edit.kind,
+        ShaderRowEditKind::Scalar | ShaderRowEditKind::Int | ShaderRowEditKind::StringId
+    ) {
+        return None;
+    }
+    let default = row.default_cell.as_ref()?;
+    if default.color.is_some() {
+        return None;
+    }
+    let raw = default.text.trim();
+    if raw.starts_with("vector:") {
+        return None;
+    }
+    let input = raw.rsplit(": ").next().unwrap_or(raw).trim().to_owned();
+    (!input.is_empty()).then(|| PendingFieldEdit {
+        path: row_edit.path.clone(),
+        input,
+    })
+}
+
+/// Compare two grid-cell value texts, tolerating numeric formatting differences
+/// (e.g. `value: 1` vs `value: 1.0`) that arise on the classic (H2) path.
+fn shader_value_text_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim(), b.trim());
+    if a == b {
+        return true;
+    }
+    let na = a.rsplit(": ").next().unwrap_or(a);
+    let nb = b.rsplit(": ").next().unwrap_or(b);
+    match (na.parse::<f64>(), nb.parse::<f64>()) {
+        (Ok(x), Ok(y)) => (x - y).abs() < 1e-5,
+        _ => false,
+    }
+}
+
+fn shader_label_width_id() -> egui::Id {
+    egui::Id::new("shader_grid_label_width")
+}
+
+/// Session-persisted width of the shader grid's label column (Phase 4.3 resizable
+/// columns); dragged via the per-row splitter, read by every row.
+fn shader_label_width(ui: &Ui) -> f32 {
+    ui.data(|d| d.get_temp::<f32>(shader_label_width_id()))
+        .unwrap_or(230.0)
+        .clamp(120.0, 460.0)
+}
+
 pub(super) fn draw_shader_grid_row(
     ui: &mut Ui,
     row: &ShaderGridRow,
@@ -5490,7 +5567,8 @@ pub(super) fn draw_shader_grid_row(
     let editable = edit.editable;
     let available = ui.available_width().max(780.0);
     let indent = depth as f32 * 10.0;
-    let label_width = (230.0_f32 - indent).max(150.0);
+    let base_label_width = shader_label_width(ui);
+    let label_width = (base_label_width - indent).max(110.0);
     let default_width = 110.0;
     let has_h2_range = h2_range_control_for_row(row).is_some();
     let right_controls_width = shader_right_controls_width(row, has_h2_range);
@@ -5502,6 +5580,14 @@ pub(super) fn draw_shader_grid_row(
         [rect.left_bottom(), rect.right_bottom()],
         Stroke::new(1.0, material_grid_light()),
     );
+    let modified = row_differs_from_default(row);
+    if modified {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(rect.left_top(), Vec2::new(3.0, height)),
+            0.0,
+            SHADER_MODIFIED_ACCENT,
+        );
+    }
 
     let label_rect = egui::Rect::from_min_size(
         rect.left_top() + Vec2::new(4.0 + indent, 0.0),
@@ -5514,6 +5600,39 @@ pub(super) fn draw_shader_grid_row(
         FontId::proportional(12.5),
         row_text,
     );
+    // Per-parameter "help": hovering the label shows the full (untruncated) name
+    // plus its parameter type — rmop parameters carry no description text.
+    if !row.label.is_empty() {
+        let hover = match row.parameter_type.as_deref() {
+            Some(parameter_type) => format!("{}\n{}", row.label, parameter_type),
+            None => row.label.clone(),
+        };
+        ui.interact(
+            label_rect,
+            ui.make_persistent_id(("shader_label_hover", &row.label)),
+            Sense::hover(),
+        )
+        .on_hover_text(hover);
+    }
+    // Resizable label column (Phase 4.3): a drag handle at the label/value
+    // boundary updates the shared session width that every row reads.
+    let split_x = label_rect.right() + 1.0;
+    let split_resp = ui.interact(
+        egui::Rect::from_center_size(egui::pos2(split_x, rect.center().y), Vec2::new(6.0, height)),
+        ui.make_persistent_id(("shader_col_split", &row.label)),
+        Sense::drag(),
+    );
+    if split_resp.hovered() || split_resp.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        ui.painter().line_segment(
+            [egui::pos2(split_x, rect.top()), egui::pos2(split_x, rect.bottom())],
+            Stroke::new(1.0, row_text),
+        );
+    }
+    if split_resp.dragged() {
+        let new_width = (base_label_width + split_resp.drag_delta().x).clamp(120.0, 460.0);
+        ui.data_mut(|d| d.insert_temp(shader_label_width_id(), new_width));
+    }
 
     let default_rect = egui::Rect::from_min_size(
         label_rect.right_top() + Vec2::new(2.0, 2.0),
@@ -5730,19 +5849,37 @@ pub(super) fn draw_shader_grid_row(
         }
     } else {
         // context_menu takes &self so call it first; on_hover_text takes self.
-        if let (true, Some(menu)) = (editable, row.context_menu.as_ref()) {
-            if !menu.items.is_empty() {
-                response.context_menu(|ui| {
+        let reset = (editable && modified)
+            .then(|| reset_edit_for_row(row))
+            .flatten();
+        let menu_items = row
+            .context_menu
+            .as_ref()
+            .filter(|_| editable)
+            .map(|menu| menu.items.as_slice())
+            .filter(|items| !items.is_empty());
+        if reset.is_some() || menu_items.is_some() {
+            response.context_menu(|ui| {
+                if let Some(reset) = reset.clone() {
+                    if ui.button("Reset to default").clicked() {
+                        edit.pending.push(reset);
+                        ui.close_menu();
+                    }
+                }
+                if let Some(items) = menu_items {
+                    if reset.is_some() {
+                        ui.separator();
+                    }
                     ui.label("Add optional argument:");
                     ui.separator();
-                    for item in &menu.items {
+                    for item in items {
                         if ui.button(&item.label).clicked() {
                             push_shader_context_action(edit, &item.action);
                             ui.close_menu();
                         }
                     }
-                });
-            }
+                }
+            });
         }
         if let Some(parameter_type) = row.parameter_type.as_deref() {
             response.on_hover_text(parameter_type);
@@ -6052,6 +6189,74 @@ fn draw_h2_value_prefixed_text_edit(
 /// Render an editable widget inside a shader grid value cell and push a
 /// `PendingFieldEdit` on commit. The leaf field type drives parsing in
 /// `apply_field_edit`, so scalars/ints/refs all just emit the text.
+/// Decode a referenced bitmap into a small thumbnail texture, cached in egui
+/// memory keyed by ref path (Phase 4.2). `Some(None)` is cached for refs that
+/// fail to load/decode so the decode isn't retried every frame.
+fn shader_bitmap_thumbnail(
+    ui: &Ui,
+    edit: &FieldEditContext<'_>,
+    group_tag: u32,
+    open_ref: &str,
+) -> Option<egui::TextureHandle> {
+    let cache_id = egui::Id::new(("shader_bitmap_thumb", group_tag, open_ref));
+    if let Some(cached) = ui.data(|d| d.get_temp::<Option<egui::TextureHandle>>(cache_id)) {
+        return cached;
+    }
+    let decoded = decode_shader_bitmap_thumbnail(ui.ctx(), edit, group_tag, open_ref);
+    ui.data_mut(|d| d.insert_temp(cache_id, decoded.clone()));
+    decoded
+}
+
+fn decode_shader_bitmap_thumbnail(
+    ctx: &egui::Context,
+    edit: &FieldEditContext<'_>,
+    group_tag: u32,
+    open_ref: &str,
+) -> Option<egui::TextureHandle> {
+    let root = edit.tags_root?;
+    let ext = blam_tags::paths::group_tag_to_extension(group_tag)?;
+    let path = blam_tags::paths::resolve_tag_path(root, open_ref, ext);
+    // Use the source-aware loader so classic (Halo CE / Halo 2) bitmaps decode
+    // too — they need a JSON layout, not the plain `TagFile::read`.
+    let tag =
+        crate::source::read_tag_at_path(&path, edit.game, edit.definitions_root, group_tag).ok()?;
+    let data = build_bitmap_preview(&tag, 0, 0).ok()?;
+    // Cap at 256px: drawn small inline (GPU downscales) and at native size in the
+    // hover preview popup, matching Foundation's 256px help-popup image.
+    let (rgba, w, h) = downscale_rgba(&data.rgba, data.width, data.height, 256);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+    Some(ctx.load_texture(
+        format!("shader_thumb:{group_tag}:{open_ref}"),
+        image,
+        egui::TextureOptions::LINEAR,
+    ))
+}
+
+/// Nearest-neighbour downscale of an RGBA8 image to fit within `max` px.
+fn downscale_rgba(rgba: &[u8], width: u32, height: u32, max: u32) -> (Vec<u8>, usize, usize) {
+    let (w, h) = (width as usize, height as usize);
+    if w == 0 || h == 0 || rgba.len() < w * h * 4 {
+        return (Vec::new(), 0, 0);
+    }
+    let scale = (max as f32 / w.max(h) as f32).min(1.0);
+    let nw = ((w as f32 * scale).round() as usize).max(1);
+    let nh = ((h as f32 * scale).round() as usize).max(1);
+    let mut out = vec![0u8; nw * nh * 4];
+    for y in 0..nh {
+        let sy = (y * h / nh).min(h - 1);
+        for x in 0..nw {
+            let sx = (x * w / nw).min(w - 1);
+            let si = (sy * w + sx) * 4;
+            let di = (y * nw + x) * 4;
+            out[di..di + 4].copy_from_slice(&rgba[si..si + 4]);
+        }
+    }
+    (out, nw, nh)
+}
+
 pub(super) fn draw_shader_editable_value(
     ui: &mut Ui,
     rect: egui::Rect,
@@ -6209,11 +6414,6 @@ pub(super) fn draw_shader_editable_value(
                 rect.right_top() - Vec2::new(70.0, 0.0),
                 Vec2::new(40.0, rect.height()),
             );
-            let text_rect = egui::Rect::from_min_size(
-                rect.left_top(),
-                Vec2::new((rect.width() - 72.0).max(40.0), rect.height()),
-            );
-            // Open the referenced bitmap in a new tab (when the ref is set).
             // The grid stores the path with a ".bitmap" suffix and forward
             // slashes; strip both so it resolves like a normal tag reference.
             let cleaned = sanitize_ref_path(&current);
@@ -6222,6 +6422,51 @@ pub(super) fn draw_shader_editable_value(
                 .unwrap_or(&cleaned)
                 .replace('/', "\\");
             let open_enabled = !open_ref.is_empty() && open_ref != "NONE";
+            // Inline thumbnail of the referenced bitmap (Phase 4.2), at the left.
+            let thumb = open_enabled
+                .then(|| shader_bitmap_thumbnail(ui, edit, *group_tag, &open_ref))
+                .flatten();
+            let (thumb_w, thumb_gap) = if thumb.is_some() {
+                (rect.height() - 2.0, 4.0)
+            } else {
+                (0.0, 0.0)
+            };
+            if let Some(texture) = &thumb {
+                let thumb_rect = egui::Rect::from_min_size(
+                    rect.left_top() + Vec2::new(0.0, 1.0),
+                    Vec2::splat(rect.height() - 2.0),
+                );
+                ui.painter().image(
+                    texture.id(),
+                    thumb_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+                // Hover → enlarged preview popup (up to native, ≤256px) + path,
+                // mirroring Foundation's help-popup image.
+                ui.interact(
+                    thumb_rect,
+                    ui.make_persistent_id(("shader_thumb_hover", &open_ref)),
+                    Sense::hover(),
+                )
+                .on_hover_ui(|ui| {
+                    let native = texture.size_vec2();
+                    let scale = (256.0 / native.x.max(native.y).max(1.0)).min(1.0);
+                    ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                        texture.id(),
+                        native * scale,
+                    )));
+                    ui.label(RichText::new(&open_ref).small().color(material_muted_text()));
+                });
+            }
+            let text_rect = egui::Rect::from_min_size(
+                rect.left_top() + Vec2::new(thumb_w + thumb_gap, 0.0),
+                Vec2::new(
+                    (rect.width() - 72.0 - thumb_w - thumb_gap).max(40.0),
+                    rect.height(),
+                ),
+            );
+            // Open the referenced bitmap in a new tab (when the ref is set).
             ui.painter().rect_filled(
                 open_rect,
                 0.0,
@@ -6247,12 +6492,14 @@ pub(super) fn draw_shader_editable_value(
                         ui.make_persistent_id(format!("shader_bitmap_open:{}", buffer_key)),
                         Sense::click(),
                     )
-                    .on_hover_text("Open the referenced bitmap tag")
+                    .on_hover_text("Open the referenced bitmap tag (Alt: floating window)")
                     .clicked()
             {
+                let float = ui.input(|i| i.modifiers.alt);
                 *edit.open_request = Some(OpenTagRequest {
                     group_tag: *group_tag,
                     rel_path: open_ref.clone(),
+                    float,
                 });
             }
             let id = edit.widget_id(("shader_text", &buffer_key));
@@ -6263,42 +6510,66 @@ pub(super) fn draw_shader_editable_value(
             if !ui.memory(|m| m.has_focus(id)) && *buffer != current {
                 *buffer = current.clone();
             }
+            // Flag a referenced bitmap that is missing on disk (red text).
+            let missing = open_enabled
+                && reference_target_missing(edit.tags_root, *group_tag, &open_ref);
+            let text_color = if missing {
+                REFERENCE_MISSING_COLOR
+            } else {
+                material_text()
+            };
             let mut commit = None;
-            let text_response = ui
-                .scope_builder(egui::UiBuilder::new().max_rect(text_rect), |ui| {
-                    ui.visuals_mut().extreme_bg_color = material_input();
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(buffer)
-                            .id(id)
-                            .desired_width(text_rect.width())
-                            .text_color(material_text())
-                            .font(egui::TextStyle::Monospace),
-                    );
-                    text_edit_cursor_to_start_on_tab_focus(ui, &resp);
-                    if resp.lost_focus() && buffer.trim() != current.trim() {
-                        commit = Some(buffer.trim().to_owned());
-                    }
-                    resp
-                })
-                .inner;
-            paint_tag_reference_drop_feedback(ui, &text_response, Some(*group_tag));
-            if edit.editable {
-                if let Some(payload) = text_response.dnd_release_payload::<TagDragPayload>() {
-                    match tag_reference_drop_input(&payload, Some(*group_tag)) {
-                        Ok(input) => {
-                            *buffer = input.clone();
-                            commit = Some(input);
-                        }
-                        Err(error) => {
-                            if let Some(status) = edit.status.as_deref_mut() {
-                                *status = error;
-                            }
-                        }
-                    }
+            ui.scope_builder(egui::UiBuilder::new().max_rect(text_rect), |ui| {
+                ui.visuals_mut().extreme_bg_color = material_input();
+                let resp = ui.add(
+                    egui::TextEdit::singleline(buffer)
+                        .id(id)
+                        .desired_width(text_rect.width())
+                        .hint_text("(no reference)")
+                        .text_color(text_color)
+                        .font(egui::TextStyle::Monospace),
+                );
+                if missing {
+                    resp.clone()
+                        .on_hover_text("Referenced bitmap not found on disk");
                 }
-            }
+                text_edit_cursor_to_start_on_tab_focus(ui, &resp);
+                if resp.lost_focus() && buffer.trim() != current.trim() {
+                    commit = Some(buffer.trim().to_owned());
+                }
+            });
             if let Some(input) = commit {
                 push_shader_value_edit(edit, row_edit, create.as_ref(), input);
+            }
+            // Drag-and-drop: drop a bitmap tag from the browser onto the cell to
+            // set the reference. Accept only bitmap-group tags.
+            if edit.editable {
+                let drop = ui.interact(
+                    text_rect,
+                    ui.make_persistent_id(("shader_bitmap_drop", &buffer_key)),
+                    Sense::hover(),
+                );
+                let is_bitmap = |payload: &DraggedTagRef| &payload.group_tag.to_be_bytes() == b"bitm";
+                if let Some(payload) = drop.dnd_hover_payload::<DraggedTagRef>() {
+                    let color = if is_bitmap(&payload) {
+                        Color32::from_rgb(120, 170, 90)
+                    } else {
+                        REFERENCE_MISSING_COLOR
+                    };
+                    ui.painter()
+                        .rect_stroke(text_rect, 2.0, Stroke::new(1.5, color));
+                }
+                if let Some(payload) = drop.dnd_release_payload::<DraggedTagRef>() {
+                    if is_bitmap(&payload) {
+                        edit.buffers.insert(buffer_key.clone(), payload.rel_path.clone());
+                        push_shader_value_edit(
+                            edit,
+                            row_edit,
+                            create.as_ref(),
+                            payload.rel_path.clone(),
+                        );
+                    }
+                }
             }
             // "..." browse button
             ui.painter().rect_filled(browse_rect, 0.0, material_input());
@@ -6395,6 +6666,7 @@ pub(super) fn draw_shader_editable_value(
                 *edit.open_request = Some(OpenTagRequest {
                     group_tag: u32::from_be_bytes(*b"stem"),
                     rel_path: open_ref.clone(),
+                    float: ui.input(|i| i.modifiers.alt),
                 });
             }
 
@@ -6424,20 +6696,22 @@ pub(super) fn draw_shader_editable_value(
                     resp
                 })
                 .inner;
+            // Drop a shader_template tag from the browser onto the cell.
             let shader_template_group = u32::from_be_bytes(*b"stem");
-            paint_tag_reference_drop_feedback(ui, &text_response, Some(shader_template_group));
+            let template_ok = |payload: &DraggedTagRef| payload.group_tag == shader_template_group;
+            if let Some(payload) = text_response.dnd_hover_payload::<DraggedTagRef>() {
+                let color = if template_ok(&payload) {
+                    Color32::from_rgb(120, 170, 90)
+                } else {
+                    REFERENCE_MISSING_COLOR
+                };
+                ui.painter()
+                    .rect_stroke(text_response.rect, 2.0, Stroke::new(1.5, color));
+            }
             if edit.editable {
-                if let Some(payload) = text_response.dnd_release_payload::<TagDragPayload>() {
-                    match tag_reference_drop_input(&payload, Some(shader_template_group)) {
-                        Ok(input) => {
-                            *buffer = input.clone();
-                            commit = Some(input);
-                        }
-                        Err(error) => {
-                            if let Some(status) = edit.status.as_deref_mut() {
-                                *status = error;
-                            }
-                        }
+                if let Some(payload) = text_response.dnd_release_payload::<DraggedTagRef>() {
+                    if template_ok(&payload) {
+                        commit = Some(payload.rel_path.clone());
                     }
                 }
             }
@@ -7434,3 +7708,81 @@ pub(super) fn find_first_function(tag_struct: TagStruct<'_>) -> Option<FunctionV
     }
     None
 }
+
+#[cfg(test)]
+mod phase4_tests {
+    use super::*;
+
+    fn cell(text: &str) -> ShaderGridCell {
+        ShaderGridCell {
+            text: text.to_owned(),
+            value_kind: "value",
+            color: None,
+        }
+    }
+
+    #[test]
+    fn differs_compares_value_vs_default() {
+        let mut row = empty_shader_grid_row();
+        row.default_cell = Some(cell("value: 1.0"));
+        row.value_cell = cell("value: 1.0");
+        assert!(!row_differs_from_default(&row), "equal values don't differ");
+        row.value_cell = cell("value: 2.0");
+        assert!(row_differs_from_default(&row), "changed value differs");
+        // numeric tolerance: "1" vs "1.0" are equal
+        row.value_cell = cell("value: 1");
+        assert!(!row_differs_from_default(&row));
+        // the "Override Default" placeholder never counts as modified
+        row.value_cell = cell("Override Default");
+        assert!(!row_differs_from_default(&row));
+        // no default => never modified
+        row.default_cell = None;
+        row.value_cell = cell("value: 9");
+        assert!(!row_differs_from_default(&row));
+    }
+
+    #[test]
+    fn downscale_rgba_caps_dimensions_and_preserves_corners() {
+        // 4×2 image, two colors per row; downscale to fit within 2px.
+        let red = [255u8, 0, 0, 255];
+        let blue = [0u8, 0, 255, 255];
+        let mut rgba = Vec::new();
+        for _ in 0..2 {
+            for x in 0..4 {
+                rgba.extend_from_slice(if x < 2 { &red } else { &blue });
+            }
+        }
+        let (out, w, h) = downscale_rgba(&rgba, 4, 2, 2);
+        assert_eq!((w, h), (2, 1), "scaled to fit within 2px, aspect kept");
+        assert_eq!(out.len(), w * h * 4);
+        // left sample is red, right sample is blue.
+        assert_eq!(&out[0..4], &red);
+        assert_eq!(&out[4..8], &blue);
+        // malformed input yields an empty image.
+        assert_eq!(downscale_rgba(&[], 4, 2, 2).1, 0);
+    }
+
+    #[test]
+    fn reset_edit_strips_prefix_for_scalar_only() {
+        let mut row = empty_shader_grid_row();
+        row.default_cell = Some(cell("value: 0.5"));
+        row.edit = Some(ShaderRowEdit {
+            path: "parameters[0]/value".to_owned(),
+            current: "2.0".to_owned(),
+            kind: ShaderRowEditKind::Scalar,
+        });
+        let reset = reset_edit_for_row(&row).expect("scalar is resettable");
+        assert_eq!(reset.path, "parameters[0]/value");
+        assert_eq!(reset.input, "0.5");
+        // vectors are not reset (multi-component)
+        row.default_cell = Some(cell("vector: 1,2,3"));
+        assert!(reset_edit_for_row(&row).is_none());
+        // rows without an edit path can't reset
+        row.default_cell = Some(cell("value: 0.5"));
+        row.edit = None;
+        assert!(reset_edit_for_row(&row).is_none());
+    }
+}
+
+
+

@@ -1,5 +1,118 @@
 use super::*;
 
+/// A pending "reveal in tree" request threaded through the tree draw: it force-
+/// opens the folder nodes along `remaining` (ancestor labels not yet descended)
+/// and scrolls the matching leaf (`key`) into view. One-shot — cleared by the
+/// caller after the frame.
+#[derive(Clone, Copy)]
+pub(super) struct Reveal<'a> {
+    pub(super) key: &'a str,
+    pub(super) remaining: &'a [String],
+}
+
+impl<'a> Reveal<'a> {
+    /// True when this node's label is the next ancestor to descend into.
+    fn matches_node(self, label: &str) -> bool {
+        self.remaining.first().map(String::as_str) == Some(label)
+    }
+
+    /// The reveal to forward to a matching node's children (one segment shorter).
+    fn descend(self) -> Reveal<'a> {
+        Reveal {
+            key: self.key,
+            remaining: self.remaining.get(1..).unwrap_or(&[]),
+        }
+    }
+
+    /// The leaf key to scroll, but only once all ancestors have been descended
+    /// (i.e. this node directly contains the target entry).
+    fn leaf_key(self) -> Option<&'a str> {
+        self.remaining.is_empty().then_some(self.key)
+    }
+}
+
+/// Build the reference-input string for a tag entry — `"fourcc:back\\slash"`
+/// (group four-CC + extension-less backslash path) — matching the format
+/// [`choose_tag_reference_input`] produces, for use as a drag payload.
+fn entry_reference_input(entry: &TagEntry) -> String {
+    let display = &entry.display_path;
+    let without_ext = match display.rfind('.') {
+        Some(dot) => &display[..dot],
+        None => display.as_str(),
+    };
+    format!(
+        "{}:{}",
+        format_group_tag(entry.group_tag),
+        without_ext.replace('/', "\\")
+    )
+}
+
+/// Forward-slash, extension-less relative path of an entry — the form shader
+/// bitmap rows use for their references.
+fn entry_rel_path(entry: &TagEntry) -> String {
+    let display = &entry.display_path;
+    let without_ext = match display.rfind('.') {
+        Some(dot) => &display[..dot],
+        None => display.as_str(),
+    };
+    without_ext.replace('\\', "/")
+}
+
+fn entry_filename_lower(entry: &TagEntry) -> String {
+    entry
+        .display_path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&entry.display_path)
+        .to_ascii_lowercase()
+}
+
+/// Reorder a node's entry indices for display. `Natural` borrows the input with
+/// no allocation; `Name`/`Type` clone-and-sort.
+fn ordered_indices<'a>(
+    indices: &'a [usize],
+    entries: &[TagEntry],
+    sort: BrowserSort,
+) -> std::borrow::Cow<'a, [usize]> {
+    use std::borrow::Cow;
+    match sort {
+        BrowserSort::Natural => Cow::Borrowed(indices),
+        BrowserSort::Name => {
+            let mut sorted = indices.to_vec();
+            sorted.sort_by(|&a, &b| {
+                entry_filename_lower(&entries[a]).cmp(&entry_filename_lower(&entries[b]))
+            });
+            Cow::Owned(sorted)
+        }
+        BrowserSort::Type => {
+            let mut sorted = indices.to_vec();
+            sorted.sort_by(|&a, &b| {
+                let key_a = (
+                    format_group_tag(entries[a].group_tag),
+                    entry_filename_lower(&entries[a]),
+                );
+                let key_b = (
+                    format_group_tag(entries[b].group_tag),
+                    entry_filename_lower(&entries[b]),
+                );
+                key_a.cmp(&key_b)
+            });
+            Cow::Owned(sorted)
+        }
+    }
+}
+
+/// Folder-label ancestors of a tag's display path (filename removed).
+pub(super) fn ancestor_labels(display_path: &str) -> Vec<String> {
+    let mut segments: Vec<String> = display_path
+        .replace('\\', "/")
+        .split('/')
+        .map(str::to_owned)
+        .collect();
+    segments.pop(); // drop the filename
+    segments
+}
+
 pub(super) fn draw_tree(
     ui: &mut Ui,
     tree: &TagTree,
@@ -9,6 +122,8 @@ pub(super) fn draw_tree(
     show_prefixes: bool,
     double_click_to_open: bool,
     groups_mode: bool,
+    reveal: Option<Reveal>,
+    sort: BrowserSort,
 ) -> Option<BrowserAction> {
     let mut clicked = None;
     clicked = clicked.or_else(|| {
@@ -20,6 +135,8 @@ pub(super) fn draw_tree(
             filter,
             show_prefixes,
             double_click_to_open,
+            reveal.and_then(Reveal::leaf_key),
+            sort,
         )
     });
     for node in &tree.children {
@@ -33,6 +150,8 @@ pub(super) fn draw_tree(
                 show_prefixes,
                 double_click_to_open,
                 groups_mode,
+                reveal,
+                sort,
             )
         });
     }
@@ -51,6 +170,8 @@ pub(super) fn draw_tree_lazy(
     show_prefixes: bool,
     double_click_to_open: bool,
     status_update: &mut Option<String>,
+    reveal: Option<Reveal>,
+    sort: BrowserSort,
 ) -> Option<BrowserAction> {
     let mut clicked = None;
     clicked = clicked.or_else(|| {
@@ -62,6 +183,8 @@ pub(super) fn draw_tree_lazy(
             filter,
             show_prefixes,
             double_click_to_open,
+            reveal.and_then(Reveal::leaf_key),
+            sort,
         )
     });
     for node in &mut tree.children {
@@ -78,6 +201,8 @@ pub(super) fn draw_tree_lazy(
                 show_prefixes,
                 double_click_to_open,
                 status_update,
+                reveal,
+                sort,
             )
         });
     }
@@ -97,10 +222,14 @@ pub(super) fn draw_tree_node_lazy(
     show_prefixes: bool,
     double_click_to_open: bool,
     status_update: &mut Option<String>,
+    reveal: Option<Reveal>,
+    sort: BrowserSort,
 ) -> Option<BrowserAction> {
     if !filter.is_empty() && !lazy_node_matches(node, entries, filter) {
         return None;
     }
+    let on_path = reveal.is_some_and(|reveal| reveal.matches_node(&node.label));
+    let inner_reveal = on_path.then(|| reveal.expect("on_path implies reveal").descend());
     let mut clicked = None;
     let folder_label = if show_prefixes {
         format!("[folder] {}", node.label)
@@ -110,6 +239,7 @@ pub(super) fn draw_tree_node_lazy(
     let response = egui::CollapsingHeader::new(RichText::new(folder_label).color(text_dark()))
         .icon(folder_arrow_icon)
         .default_open(!filter.is_empty())
+        .open(on_path.then_some(true))
         .show(ui, |ui| {
             if !node.entries_loaded {
                 match load_folder_node_entries(root, node, entries, names) {
@@ -129,6 +259,7 @@ pub(super) fn draw_tree_node_lazy(
                     }
                 }
             }
+            let leaf_key = inner_reveal.and_then(Reveal::leaf_key);
             if clicked.is_none() {
                 clicked = draw_entry_list(
                     ui,
@@ -138,6 +269,8 @@ pub(super) fn draw_tree_node_lazy(
                     filter,
                     show_prefixes,
                     double_click_to_open,
+                    leaf_key,
+                    sort,
                 );
             } else {
                 let _ = draw_entry_list(
@@ -148,6 +281,8 @@ pub(super) fn draw_tree_node_lazy(
                     filter,
                     show_prefixes,
                     double_click_to_open,
+                    leaf_key,
+                    sort,
                 );
             }
             for child in &mut node.children {
@@ -164,6 +299,8 @@ pub(super) fn draw_tree_node_lazy(
                         show_prefixes,
                         double_click_to_open,
                         status_update,
+                        inner_reveal,
+                        sort,
                     );
                 }
             }
@@ -244,10 +381,14 @@ pub(super) fn draw_tree_node(
     show_prefixes: bool,
     double_click_to_open: bool,
     groups_mode: bool,
+    reveal: Option<Reveal>,
+    sort: BrowserSort,
 ) -> Option<BrowserAction> {
     if !filter.is_empty() && !node_matches(node, entries, filter) {
         return None;
     }
+    let on_path = reveal.is_some_and(|reveal| reveal.matches_node(&node.label));
+    let inner_reveal = on_path.then(|| reveal.expect("on_path implies reveal").descend());
     let mut clicked = None;
     let folder_label = if groups_mode {
         group_folder_label(&node.label, show_prefixes)
@@ -259,7 +400,9 @@ pub(super) fn draw_tree_node(
     let response = egui::CollapsingHeader::new(RichText::new(folder_label).color(text_dark()))
         .icon(folder_arrow_icon)
         .default_open(!filter.is_empty())
+        .open(on_path.then_some(true))
         .show(ui, |ui| {
+            let leaf_key = inner_reveal.and_then(Reveal::leaf_key);
             if clicked.is_none() {
                 clicked = draw_entry_list(
                     ui,
@@ -269,6 +412,8 @@ pub(super) fn draw_tree_node(
                     filter,
                     show_prefixes,
                     double_click_to_open,
+                    leaf_key,
+                    sort,
                 );
             } else {
                 let _ = draw_entry_list(
@@ -279,6 +424,8 @@ pub(super) fn draw_tree_node(
                     filter,
                     show_prefixes,
                     double_click_to_open,
+                    leaf_key,
+                    sort,
                 );
             }
             for child in &node.children {
@@ -292,6 +439,8 @@ pub(super) fn draw_tree_node(
                         show_prefixes,
                         double_click_to_open,
                         groups_mode,
+                        inner_reveal,
+                        sort,
                     );
                 }
             }
@@ -453,7 +602,11 @@ pub(super) fn draw_entry_list(
     filter: &str,
     show_prefixes: bool,
     double_click_to_open: bool,
+    reveal_key: Option<&str>,
+    sort: BrowserSort,
 ) -> Option<BrowserAction> {
+    let ordered = ordered_indices(entry_indices, entries, sort);
+    let entry_indices: &[usize] = ordered.as_ref();
     if filter.is_empty() && entry_indices.len() > MAX_BROWSER_ENTRIES_PER_NODE {
         return draw_capped_entry_list(
             ui,
@@ -462,6 +615,7 @@ pub(super) fn draw_entry_list(
             selected,
             show_prefixes,
             double_click_to_open,
+            reveal_key,
         );
     }
 
@@ -472,9 +626,9 @@ pub(super) fn draw_entry_list(
             continue;
         }
         if clicked.is_none() {
-            clicked = draw_entry(ui, entry, selected, show_prefixes, double_click_to_open);
+            clicked = draw_entry(ui, entry, selected, show_prefixes, double_click_to_open, reveal_key);
         } else {
-            let _ = draw_entry(ui, entry, selected, show_prefixes, double_click_to_open);
+            let _ = draw_entry(ui, entry, selected, show_prefixes, double_click_to_open, reveal_key);
         }
     }
     clicked
@@ -487,6 +641,7 @@ pub(super) fn draw_capped_entry_list(
     selected: Option<&str>,
     show_prefixes: bool,
     double_click_to_open: bool,
+    reveal_key: Option<&str>,
 ) -> Option<BrowserAction> {
     let mut clicked = None;
     let selected_index = selected.and_then(|selected| {
@@ -498,9 +653,9 @@ pub(super) fn draw_capped_entry_list(
     for &entry_index in entry_indices.iter().take(MAX_BROWSER_ENTRIES_PER_NODE) {
         let entry = &entries[entry_index];
         if clicked.is_none() {
-            clicked = draw_entry(ui, entry, selected, show_prefixes, double_click_to_open);
+            clicked = draw_entry(ui, entry, selected, show_prefixes, double_click_to_open, reveal_key);
         } else {
-            let _ = draw_entry(ui, entry, selected, show_prefixes, double_click_to_open);
+            let _ = draw_entry(ui, entry, selected, show_prefixes, double_click_to_open, reveal_key);
         }
     }
 
@@ -509,9 +664,9 @@ pub(super) fn draw_capped_entry_list(
             ui.label(RichText::new("...").color(subtle_dark()));
             let entry = &entries[entry_indices[position]];
             if clicked.is_none() {
-                clicked = draw_entry(ui, entry, selected, show_prefixes, double_click_to_open);
+                clicked = draw_entry(ui, entry, selected, show_prefixes, double_click_to_open, reveal_key);
             } else {
-                let _ = draw_entry(ui, entry, selected, show_prefixes, double_click_to_open);
+                let _ = draw_entry(ui, entry, selected, show_prefixes, double_click_to_open, reveal_key);
             }
         }
     }
@@ -538,6 +693,7 @@ pub(super) fn draw_entry(
     selected: Option<&str>,
     show_prefixes: bool,
     double_click_to_open: bool,
+    reveal_key: Option<&str>,
 ) -> Option<BrowserAction> {
     let leaf_label = entry
         .display_path
@@ -549,16 +705,23 @@ pub(super) fn draw_entry(
     } else {
         leaf_label.to_owned()
     };
-    let drag_payload = TagDragPayload {
-        rel_path: entry.display_path.clone(),
+    // The row is a drag source: drag it onto a tag-reference cell to set the
+    // reference. Payload is our `DraggedTagRef` (what the ref-cell + shader-row
+    // drop targets expect); the row paints a tag icon + a cursor drag-preview.
+    let payload = DraggedTagRef {
         group_tag: entry.group_tag,
-        label: leaf_label.to_owned(),
+        input: entry_reference_input(entry),
+        rel_path: entry_rel_path(entry),
+        label: label.clone(),
     };
     let selected = selected == Some(entry.key.as_str());
     let row_size = Vec2::new(ui.available_width(), ui.spacing().interact_size.y);
     let (row_rect, response) = ui.allocate_exact_size(row_size, Sense::click_and_drag());
     let response = response.on_hover_text(&entry.display_path);
-    response.dnd_set_drag_payload(drag_payload);
+    response.dnd_set_drag_payload(payload);
+    if reveal_key == Some(entry.key.as_str()) {
+        response.scroll_to_me(Some(egui::Align::Center));
+    }
     if ui.is_rect_visible(row_rect) {
         let visuals = ui.style().interact_selectable(&response, selected);
         if selected || response.hovered() || response.highlighted() || response.has_focus() {
@@ -606,6 +769,18 @@ pub(super) fn draw_entry(
         }
         if ui.button("Open with File Explorer").clicked() {
             action = Some(BrowserAction::OpenInExplorer(entry.key.clone()));
+            ui.close_menu();
+        }
+        if ui.button("Find references").clicked() {
+            action = Some(BrowserAction::FindReferences(entry.key.clone()));
+            ui.close_menu();
+        }
+        if ui.button("Explore references...").clicked() {
+            action = Some(BrowserAction::ExploreReferences(entry.key.clone()));
+            ui.close_menu();
+        }
+        if ui.button("Rename / Move (fix references)...").clicked() {
+            action = Some(BrowserAction::RenameTag(entry.key.clone()));
             ui.close_menu();
         }
         ui.separator();
@@ -841,6 +1016,15 @@ pub(super) fn entry_matches(entry: &TagEntry, filter: &str) -> bool {
 
 /// Like [`entry_matches`] but takes an already-lowercased filter, so callers
 /// that test many entries against one query don't re-lowercase it each time.
+///
+/// Query syntax (all case-insensitive):
+/// - whitespace = AND (`elite arm` → both terms must match),
+/// - `|` = OR (`elite | rifle`),
+/// - `^foo` anchors to the start of the filename, `foo$` to the end,
+///   `^foo$` is an exact filename match.
+///
+/// A plain (un-anchored) term matches the filename, the group four-CC, or the
+/// group name; anchored terms match the filename only.
 fn entry_matches_lower(entry: &TagEntry, filter_lower: &str) -> bool {
     // Match only the filename (last path segment), not parent folder names.
     // A tag at "floodcombat_elite/garbage/hg_arm/hg_arm.model" should NOT
@@ -849,17 +1033,80 @@ fn entry_matches_lower(entry: &TagEntry, filter_lower: &str) -> bool {
         .display_path
         .rsplit(['/', '\\'])
         .next()
-        .unwrap_or(&entry.display_path);
-    filename.to_ascii_lowercase().contains(filter_lower)
-        || format_group_tag(entry.group_tag)
-            .to_ascii_lowercase()
-            .contains(filter_lower)
-        || entry
-            .group_name
-            .as_deref()
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .contains(filter_lower)
+        .unwrap_or(&entry.display_path)
+        .to_ascii_lowercase();
+    let fourcc = format_group_tag(entry.group_tag).to_ascii_lowercase();
+    let group = entry
+        .group_name
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    let mut had_term = false;
+    for or_group in filter_lower.split('|') {
+        let mut group_ok = true;
+        let mut group_had_term = false;
+        for term in or_group.split_whitespace() {
+            group_had_term = true;
+            had_term = true;
+            if !filter_term_matches(term, &filename, &fourcc, &group) {
+                group_ok = false;
+                break;
+            }
+        }
+        if group_had_term && group_ok {
+            return true;
+        }
+    }
+    // A filter with no real terms (e.g. just "|" or whitespace) matches all.
+    !had_term
+}
+
+fn filter_term_matches(term: &str, filename: &str, fourcc: &str, group: &str) -> bool {
+    let anchored_start = term.starts_with('^');
+    let anchored_end = term.ends_with('$') && term.len() > 1;
+    let inner = term.trim_start_matches('^');
+    let inner = if anchored_end {
+        &inner[..inner.len().saturating_sub(1)]
+    } else {
+        inner
+    };
+    if inner.is_empty() {
+        return true; // a lone anchor matches anything
+    }
+    match (anchored_start, anchored_end) {
+        (true, true) => filename == inner,
+        (true, false) => filename.starts_with(inner),
+        (false, true) => filename.ends_with(inner),
+        (false, false) => {
+            filename.contains(inner) || fourcc.contains(inner) || group.contains(inner)
+        }
+    }
+}
+
+/// A human-readable warning for a degenerate browser filter, or `None` when it's
+/// well-formed. The boolean grammar (space = AND, `|` = OR, `^`/`$` anchors) has
+/// no hard syntax errors, so we flag the cases that silently misbehave: an empty
+/// operand around `|`, and a term that is only an anchor.
+pub(super) fn browser_filter_warning(filter: &str) -> Option<String> {
+    let trimmed = filter.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let operands: Vec<&str> = trimmed.split('|').collect();
+    if operands.len() > 1 && operands.iter().any(|operand| operand.trim().is_empty()) {
+        return Some("empty term around '|' — that side matches nothing".to_owned());
+    }
+    for operand in &operands {
+        for term in operand.split_whitespace() {
+            let inner = term.trim_start_matches('^');
+            let inner = inner.strip_suffix('$').unwrap_or(inner);
+            if inner.is_empty() {
+                return Some(format!("'{term}' is only an anchor — matches everything"));
+            }
+        }
+    }
+    None
 }
 
 /// Collect the indices of all entries matching `filter`, in display order.
@@ -910,6 +1157,54 @@ mod tests {
         ];
         // Group four-CC match, regardless of query case.
         assert_eq!(compute_filter_matches(&entries, "WEAP"), vec![1]);
+    }
+
+    #[test]
+    fn reference_input_uses_fourcc_and_backslash_path_without_extension() {
+        let e = entry("objects/weapons/rifle/rifle.weapon", b"weap");
+        // "weap" four-CC, backslash path, extension stripped.
+        assert_eq!(
+            entry_reference_input(&e),
+            "weap:objects\\weapons\\rifle\\rifle"
+        );
+    }
+
+    #[test]
+    fn malformed_filter_warnings() {
+        // Well-formed filters: no warning.
+        assert!(browser_filter_warning("").is_none());
+        assert!(browser_filter_warning("elite").is_none());
+        assert!(browser_filter_warning("arm | rifle").is_none());
+        assert!(browser_filter_warning("^elite.model$").is_none());
+        assert!(browser_filter_warning("weapon$").is_none());
+        // Empty OR operand.
+        assert!(browser_filter_warning("foo |").is_some());
+        assert!(browser_filter_warning("a || b").is_some());
+        // Anchor-only term.
+        assert!(browser_filter_warning("^").is_some());
+        assert!(browser_filter_warning("foo ^").is_some());
+    }
+
+    #[test]
+    fn boolean_and_or_and_anchors() {
+        let entries = vec![
+            entry("characters/elite/elite_arm.model", b"mode"),
+            entry("characters/elite/elite.model", b"mode"),
+            entry("weapons/rifle.weapon", b"weap"),
+        ];
+        // AND: both terms must match the same entry.
+        assert_eq!(compute_filter_matches(&entries, "elite arm"), vec![0]);
+        // OR: either side matches.
+        assert_eq!(compute_filter_matches(&entries, "arm | rifle"), vec![0, 2]);
+        // Prefix anchor on filename.
+        assert_eq!(compute_filter_matches(&entries, "^elite_"), vec![0]);
+        // Suffix anchor on filename.
+        assert_eq!(
+            compute_filter_matches(&entries, "weapon$"),
+            vec![2]
+        );
+        // Exact filename anchor.
+        assert_eq!(compute_filter_matches(&entries, "^elite.model$"), vec![1]);
     }
 
     #[test]

@@ -36,6 +36,15 @@ pub(super) fn draw_tag(
     if !is_object_family {
         draw_object_model_summary(ui, tag, entry, names, edit);
     }
+    if is_sound_classes_group(entry.group_tag) {
+        draw_sound_classes_summary(ui, tag);
+    }
+    if is_dialogue_group(entry.group_tag) {
+        draw_dialogue_summary(ui, tag, edit);
+    }
+    if is_material_effects_group(entry.group_tag) {
+        draw_material_effects_summary(ui, tag, edit);
+    }
 
     if is_model {
         draw_model_tag_panel_tabs(ui, model_preview);
@@ -148,6 +157,452 @@ fn draw_tag_fields_scroll(
 
 const TAG_FIELD_SCROLL_MIN_WIDTH: f32 = 980.0;
 
+/// The `sound_classes` (`sncl`) tag group.
+pub(super) fn is_sound_classes_group(group_tag: u32) -> bool {
+    &group_tag.to_be_bytes() == b"sncl"
+}
+
+/// Cross-game-normalized overview of a `sound_classes` tag: one row per sound
+/// class with its near/far distance and a detail column, reading whichever
+/// distance layout the game uses (classic H2/H3/ODST keep `distance bounds`
+/// directly on the entry; Reach/H4/H2A nest them under `distance parameters`).
+/// Read-only — the full editable field tree still renders below.
+pub(super) fn draw_sound_classes_summary(ui: &mut Ui, tag: &TagFile) {
+    let Some(classes) = tag
+        .root()
+        .field("sound classes")
+        .and_then(|field| field.as_block())
+    else {
+        return;
+    };
+    let count = classes.len();
+    egui::CollapsingHeader::new(
+        RichText::new(format!("Sound Classes Overview ({count})"))
+            .strong()
+            .color(text_dark()),
+    )
+    .id_salt("sound_classes_overview")
+    .default_open(true)
+    .show(ui, |ui| {
+        if count == 0 {
+            ui.label(RichText::new("(no sound classes)").color(subtle_dark()));
+            return;
+        }
+        egui::Grid::new("sound_classes_overview_grid")
+            .striped(true)
+            .num_columns(4)
+            .show(ui, |ui| {
+                for header in ["#", "near", "far", "detail"] {
+                    ui.label(RichText::new(header).strong().color(subtle_dark()));
+                }
+                ui.end_row();
+                for index in 0..count {
+                    let Some(element) = classes.element(index) else {
+                        continue;
+                    };
+                    let row = sound_class_distance_row(&element);
+                    ui.label(RichText::new(format!("{index}")).color(subtle_dark()));
+                    ui.label(RichText::new(row.near).color(text_dark()));
+                    ui.label(RichText::new(row.far).color(text_dark()));
+                    ui.label(RichText::new(row.detail).color(subtle_dark()));
+                    ui.end_row();
+                }
+            });
+    });
+    ui.add_space(6.0);
+}
+
+struct SoundClassDistanceRow {
+    near: String,
+    far: String,
+    detail: String,
+}
+
+fn sound_class_distance_row(element: &TagStruct) -> SoundClassDistanceRow {
+    // Modern (Reach/H4/H2A): scalar distances nested under `distance parameters`.
+    if let Some(params) = element.descend("distance parameters") {
+        let near = read_real_clean(&params, "minimum distance");
+        let far = read_real_clean(&params, "maximum distance");
+        let mut detail = Vec::new();
+        if let Some(attack) = read_real_clean(&params, "attack distance") {
+            detail.push(format!("attack {attack:.1}"));
+        }
+        if let Some(sustain) = read_real_clean(&params, "sustain db") {
+            detail.push(format!("sustain {sustain:.1}dB"));
+        }
+        return SoundClassDistanceRow {
+            near: fmt_real_opt(near),
+            far: fmt_real_opt(far),
+            detail: detail.join(", "),
+        };
+    }
+    // Classic (H2/H3/ODST): `distance bounds` real_bounds directly on the entry.
+    if let Some(bounds_name) = find_full_field_name(element, "distance bounds") {
+        let bounds = element.read_real_bounds(bounds_name);
+        let detail = if let Some(attack_name) = find_full_field_name(element, "attack bounds") {
+            let attack = element.read_real_bounds(attack_name);
+            format!("attack {:.1}..{:.1}", attack.lower, attack.upper)
+        } else if let Some(silence) = element
+            .field_names()
+            .find(|name| name.to_ascii_lowercase().contains("silence"))
+            .and_then(|name| element.read_real(name))
+        {
+            format!("inner silence {silence:.1}")
+        } else {
+            String::new()
+        };
+        return SoundClassDistanceRow {
+            near: format!("{:.1}", bounds.lower),
+            far: format!("{:.1}", bounds.upper),
+            detail,
+        };
+    }
+    SoundClassDistanceRow {
+        near: "—".to_owned(),
+        far: "—".to_owned(),
+        detail: String::new(),
+    }
+}
+
+/// Resolve a field by its cleaned (display) name — the engine stores names with
+/// `:units#tooltip` / `{alias}` suffixes, so a direct `read_*(clean_name)` call
+/// would never match. Returns the full stored name to pass to typed readers.
+pub(super) fn find_full_field_name<'a>(element: &TagStruct<'a>, clean: &str) -> Option<&'a str> {
+    element
+        .field_names()
+        .find(|name| clean_field_name(name).eq_ignore_ascii_case(clean))
+}
+
+fn read_real_clean(element: &TagStruct, clean: &str) -> Option<f32> {
+    element.read_real(find_full_field_name(element, clean)?)
+}
+
+fn fmt_real_opt(value: Option<f32>) -> String {
+    match value {
+        Some(value) => format!("{value:.1}"),
+        None => "—".to_owned(),
+    }
+}
+
+/// The `dialogue` (`udlg`) tag group.
+pub(super) fn is_dialogue_group(group_tag: u32) -> bool {
+    &group_tag.to_be_bytes() == b"udlg"
+}
+
+/// First block field whose cleaned name contains `needle` (lowercased).
+fn find_block_field<'a>(element: &TagStruct<'a>, needle: &str) -> Option<TagBlock<'a>> {
+    element.field_names().find_map(|name| {
+        if clean_field_name(name).to_ascii_lowercase().contains(needle) {
+            element.field(name).and_then(|field| field.as_block())
+        } else {
+            None
+        }
+    })
+}
+
+/// First field whose cleaned name contains `needle` (lowercased).
+fn find_field_name_containing<'a>(element: &TagStruct<'a>, needle: &str) -> Option<&'a str> {
+    element
+        .field_names()
+        .find(|name| clean_field_name(name).to_ascii_lowercase().contains(needle))
+}
+
+struct DialogueRow {
+    name: String,
+    sounds: Vec<(u32, String)>,
+}
+
+/// A clickable referenced-tag label (filename shown, full path on hover). On
+/// click it returns an open request — Alt opens in a floating window.
+fn ref_open_label(ui: &mut Ui, group_tag: u32, path: &str) -> Option<OpenTagRequest> {
+    let filename = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    let clicked = ui
+        .add(egui::Label::new(RichText::new(filename).color(text_dark())).sense(Sense::click()))
+        .on_hover_text(format!("{path}\n(click to open · Alt: floating)"))
+        .clicked();
+    clicked.then(|| OpenTagRequest {
+        group_tag,
+        rel_path: path.to_owned(),
+        float: ui.input(|i| i.modifiers.alt),
+    })
+}
+
+/// Render a row's referenced tags as clickable labels (capped). Returns the
+/// first open request triggered this frame.
+fn draw_ref_cell(ui: &mut Ui, refs: &[(u32, String)]) -> Option<OpenTagRequest> {
+    const SHOWN: usize = 4;
+    if refs.is_empty() {
+        ui.label(RichText::new("(none)").color(subtle_dark()));
+        return None;
+    }
+    let mut open = None;
+    ui.horizontal_wrapped(|ui| {
+        for (index, (group_tag, path)) in refs.iter().take(SHOWN).enumerate() {
+            if index > 0 {
+                ui.label(RichText::new("·").color(subtle_dark()));
+            }
+            if let Some(request) = ref_open_label(ui, *group_tag, path) {
+                open = Some(request);
+            }
+        }
+        if refs.len() > SHOWN {
+            ui.label(
+                RichText::new(format!("+{}", refs.len() - SHOWN)).color(subtle_dark()),
+            );
+        }
+    });
+    open
+}
+
+/// Cross-game-normalized overview of a `dialogue` (`udlg`) tag: one row per
+/// vocalization with its identifier and referenced sound(s), each clickable to
+/// open the sound tag. Reads whichever layout the game uses — the `sound`
+/// reference sits directly on the vocalization (H2/H3/ODST) or nested under a
+/// per-vocalization `stimuli` block (Reach/H4/H2A). Classic Halo CE has no
+/// vocalization block (fixed per-context fields), so we note that and defer to
+/// the field tree.
+pub(super) fn draw_dialogue_summary(ui: &mut Ui, tag: &TagFile, edit: &mut FieldEditContext<'_>) {
+    let root = tag.root();
+    let Some(vocalizations) = find_block_field(&root, "vocali") else {
+        ui.label(
+            RichText::new(
+                "Classic Halo CE dialogue: fixed per-context sound references (no vocalization \
+                 block). Edit them in the field tree below.",
+            )
+            .color(subtle_dark()),
+        );
+        ui.add_space(6.0);
+        return;
+    };
+
+    const MAX_ROWS: usize = 600;
+    let total = vocalizations.len();
+    let mut rows: Vec<DialogueRow> = Vec::new();
+    let mut total_sounds = 0usize;
+    for index in 0..total.min(MAX_ROWS) {
+        let Some(vocal) = vocalizations.element(index) else {
+            continue;
+        };
+        let name = find_field_name_containing(&vocal, "vocali")
+            .and_then(|full| vocal.read_string_id(full))
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| format!("#{index}"));
+        let mut sounds = Vec::new();
+        // Direct: a `sound` reference on the vocalization itself.
+        if let Some(reference) = find_full_field_name(&vocal, "sound")
+            .and_then(|full| vocal.read_tag_ref_with_group(full))
+        {
+            sounds.push(reference);
+        }
+        // Nested: each `stimuli` element carries its own `sound` reference.
+        if let Some(stimuli) = find_block_field(&vocal, "stimul") {
+            for stimulus_index in 0..stimuli.len() {
+                if let Some(reference) = stimuli
+                    .element(stimulus_index)
+                    .and_then(|stimulus| {
+                        find_full_field_name(&stimulus, "sound")
+                            .and_then(|full| stimulus.read_tag_ref_with_group(full))
+                    })
+                {
+                    sounds.push(reference);
+                }
+            }
+        }
+        total_sounds += sounds.len();
+        rows.push(DialogueRow { name, sounds });
+    }
+
+    let mut to_open: Option<OpenTagRequest> = None;
+    egui::CollapsingHeader::new(
+        RichText::new(format!(
+            "Dialogue Overview ({total} vocalizations, {total_sounds} sounds)"
+        ))
+        .strong()
+        .color(text_dark()),
+    )
+    .id_salt("dialogue_overview")
+    .default_open(total <= 40)
+    .show(ui, |ui| {
+        if total == 0 {
+            ui.label(RichText::new("(no vocalizations)").color(subtle_dark()));
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .id_salt("dialogue_overview_scroll")
+            .max_height(280.0)
+            .show(ui, |ui| {
+                egui::Grid::new("dialogue_overview_grid")
+                    .striped(true)
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        for header in ["vocalization", "sound(s)"] {
+                            ui.label(RichText::new(header).strong().color(subtle_dark()));
+                        }
+                        ui.end_row();
+                        for row in &rows {
+                            ui.label(RichText::new(&row.name).color(text_dark()));
+                            if let Some(request) = draw_ref_cell(ui, &row.sounds) {
+                                to_open = Some(request);
+                            }
+                            ui.end_row();
+                        }
+                    });
+                if total > MAX_ROWS {
+                    ui.label(
+                        RichText::new(format!(
+                            "… {} more vocalizations not shown",
+                            total - MAX_ROWS
+                        ))
+                        .color(subtle_dark()),
+                    );
+                }
+            });
+    });
+    if to_open.is_some() {
+        *edit.open_request = to_open;
+    }
+    ui.add_space(6.0);
+}
+
+/// The `material_effects` (`foot`) tag group.
+pub(super) fn is_material_effects_group(group_tag: u32) -> bool {
+    &group_tag.to_be_bytes() == b"foot"
+}
+
+/// All block fields of a struct, paired with their cleaned display label.
+fn block_fields<'a>(element: &TagStruct<'a>) -> Vec<(String, TagBlock<'a>)> {
+    element
+        .field_names()
+        .filter_map(|name| {
+            element
+                .field(name)
+                .and_then(|field| field.as_block())
+                .map(|block| (clean_field_name(name), block))
+        })
+        .collect()
+}
+
+/// Every set tag reference (group, path) on a struct (skips empty references).
+/// Value-based so it doesn't depend on the field's name (which varies: `effect`/
+/// `sound` in CE vs `tag (effect or sound)`/`secondary tag` in modern games).
+fn struct_tag_refs(element: &TagStruct) -> Vec<(u32, String)> {
+    element
+        .field_names()
+        .filter_map(|name| element.read_tag_ref_with_group(name))
+        .filter(|(_, path)| !path.is_empty())
+        .collect()
+}
+
+struct MaterialEffectRow {
+    effect: usize,
+    block: String,
+    name: String,
+    tags: Vec<(u32, String)>,
+}
+
+/// Cross-game-normalized overview of a `material_effects` (`foot`) tag. Flattens
+/// the `effects` block and each effect's per-material sub-blocks into rows of
+/// (effect #, block, material name, referenced tag(s)). Deprecated `old
+/// materials` sub-blocks are skipped; references are read by value so the
+/// CE (`effect`/`sound`) and modern (`tag`/`secondary tag`) field names both
+/// work. Each referenced tag is clickable to open it.
+pub(super) fn draw_material_effects_summary(
+    ui: &mut Ui,
+    tag: &TagFile,
+    edit: &mut FieldEditContext<'_>,
+) {
+    let Some(effects) = find_block_field(&tag.root(), "effect") else {
+        return;
+    };
+
+    const MAX_ROWS: usize = 600;
+    let mut rows: Vec<MaterialEffectRow> = Vec::new();
+    let mut total_refs = 0usize;
+    'outer: for effect_index in 0..effects.len() {
+        let Some(effect) = effects.element(effect_index) else {
+            continue;
+        };
+        for (block_label, materials) in block_fields(&effect) {
+            if block_label.to_ascii_lowercase().contains("old") {
+                continue; // skip deprecated "old materials (DO NOT USE)" blocks
+            }
+            for material_index in 0..materials.len() {
+                let Some(material) = materials.element(material_index) else {
+                    continue;
+                };
+                let name = find_field_name_containing(&material, "material name")
+                    .and_then(|full| material.read_string_id(full))
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| format!("#{material_index}"));
+                let tags = struct_tag_refs(&material);
+                total_refs += tags.len();
+                rows.push(MaterialEffectRow {
+                    effect: effect_index,
+                    block: block_label.clone(),
+                    name,
+                    tags,
+                });
+                if rows.len() >= MAX_ROWS {
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    let truncated = rows.len() >= MAX_ROWS;
+    let mut to_open: Option<OpenTagRequest> = None;
+    egui::CollapsingHeader::new(
+        RichText::new(format!(
+            "Material Effects Overview ({} effects, {total_refs} references)",
+            effects.len()
+        ))
+        .strong()
+        .color(text_dark()),
+    )
+    .id_salt("material_effects_overview")
+    .default_open(rows.len() <= 40)
+    .show(ui, |ui| {
+        if rows.is_empty() {
+            ui.label(RichText::new("(no material entries)").color(subtle_dark()));
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .id_salt("material_effects_overview_scroll")
+            .max_height(280.0)
+            .show(ui, |ui| {
+                egui::Grid::new("material_effects_overview_grid")
+                    .striped(true)
+                    .num_columns(4)
+                    .show(ui, |ui| {
+                        for header in ["effect", "block", "material", "tag(s)"] {
+                            ui.label(RichText::new(header).strong().color(subtle_dark()));
+                        }
+                        ui.end_row();
+                        for row in &rows {
+                            ui.label(
+                                RichText::new(format!("#{}", row.effect)).color(subtle_dark()),
+                            );
+                            ui.label(RichText::new(&row.block).color(subtle_dark()));
+                            ui.label(RichText::new(&row.name).color(text_dark()));
+                            if let Some(request) = draw_ref_cell(ui, &row.tags) {
+                                to_open = Some(request);
+                            }
+                            ui.end_row();
+                        }
+                    });
+                if truncated {
+                    ui.label(
+                        RichText::new("… more rows not shown").color(subtle_dark()),
+                    );
+                }
+            });
+    });
+    if to_open.is_some() {
+        *edit.open_request = to_open;
+    }
+    ui.add_space(6.0);
+}
+
 /// Object-family tag groups (each derives from `obje` and carries a `.model`
 /// reference). For these we surface the connected model at the very top.
 pub(super) fn is_object_family_group(group_tag: u32) -> bool {
@@ -188,6 +643,7 @@ pub(super) fn draw_object_model_summary(
     let meta = FieldDisplayMeta {
         label: "model".to_owned(),
         unit: None,
+        range: None,
         help: Some("Object model tag reference".to_owned()),
         read_only: false,
         advanced: false,
@@ -694,10 +1150,8 @@ pub(super) fn apply_one_block_op(tag: &mut TagFile, op: &BlockOp) -> Result<Stri
     let mut field = root
         .field_path_mut(&op.path)
         .ok_or_else(|| "block path no longer resolves".to_owned())?;
-    let mut block = field
-        .as_block_mut()
-        .ok_or_else(|| "field is not a block".to_owned())?;
-    match &op.kind {
+    if let Some(mut block) = field.as_block_mut() {
+        return match &op.kind {
         BlockOpKind::Add => {
             let idx = block.add_element();
             Ok(format!("Added element {idx} to {}", op.path))
@@ -744,7 +1198,28 @@ pub(super) fn apply_one_block_op(tag: &mut TagFile, op: &BlockOp) -> Result<Stri
                 elements.len()
             ))
         }
+        };
     }
+    // Arrays are fixed-count: insert/delete can't apply, but an element can be
+    // replaced in place with a copied element of the same struct.
+    if let Some(mut array) = field.as_array_mut() {
+        return match &op.kind {
+            BlockOpKind::ReplaceElement { at, elements } => {
+                let element = elements
+                    .first()
+                    .ok_or_else(|| "clipboard has no element".to_owned())?;
+                array
+                    .replace_element(*at, element)
+                    .map_err(|error| format!("{error:?}"))?;
+                Ok(format!("Replaced element {at} in {}", op.path))
+            }
+            _ => Err(
+                "arrays are fixed-size — only replacing an element in place is supported"
+                    .to_owned(),
+            ),
+        };
+    }
+    Err("field is not a block or array".to_owned())
 }
 
 /// Insert `elements` consecutively starting at `at`, preserving their order.
@@ -915,7 +1390,7 @@ fn ensure_block_element_exists(tag: &TagFile, path: &str, index: usize) -> Resul
     }
 }
 
-fn add_block_element(tag: &mut TagFile, path: &str) -> Result<usize, String> {
+pub(super) fn add_block_element(tag: &mut TagFile, path: &str) -> Result<usize, String> {
     let mut root = tag.root_mut();
     let mut field = root
         .field_path_mut(path)
@@ -1480,6 +1955,9 @@ pub(super) fn field_display_meta(name: &str) -> FieldDisplayMeta {
         Some((label, help)) => (label.trim().to_owned(), Some(help.trim().to_owned())),
         None => (text, None),
     };
+    // A `[min,max]` range may sit in the unit slot (`name:[0,1]`) or bare in the
+    // name (`max sounds [1,16]`); pull it out so the unit and range are distinct.
+    let (text, range) = extract_range_hint(&text);
     let (label, unit) = match text.split_once(':') {
         Some((label, unit)) => (label.trim().to_owned(), Some(unit.trim().to_owned())),
         None => (text.trim().to_owned(), None),
@@ -1487,27 +1965,49 @@ pub(super) fn field_display_meta(name: &str) -> FieldDisplayMeta {
     FieldDisplayMeta {
         label: clean_field_name_basic(&label),
         unit: unit.filter(|unit| !unit.is_empty()),
+        range,
         help: help.filter(|help| !help.is_empty()),
         read_only,
         advanced,
     }
 }
 
+/// Split a `[ … ]` range hint out of `text`, returning `(remainder, range)`.
+/// The range keeps its brackets (e.g. `[0,+inf]`).
+fn extract_range_hint(text: &str) -> (String, Option<String>) {
+    match (text.find('['), text.rfind(']')) {
+        (Some(open), Some(close)) if open < close => {
+            let range = text[open..=close].to_owned();
+            let mut rest = text[..open].to_owned();
+            rest.push_str(&text[close + 1..]);
+            (rest, Some(range))
+        }
+        _ => (text.to_owned(), None),
+    }
+}
+
+/// Metadata shown after a field's value: the unit (preferred over the type
+/// name), then the `[range]` hint if present.
 pub(super) fn field_suffix(meta: &FieldDisplayMeta, type_name: &str) -> String {
-    meta.unit
+    let base = meta
+        .unit
         .clone()
-        .unwrap_or_else(|| clean_type_name(type_name))
+        .unwrap_or_else(|| clean_type_name(type_name));
+    match &meta.range {
+        Some(range) => {
+            if base.is_empty() {
+                range.clone()
+            } else {
+                format!("{base} {range}")
+            }
+        }
+        None => base,
+    }
 }
 
 pub(super) fn draw_field_help(ui: &mut Ui, meta: &FieldDisplayMeta) {
-    if let Some(help) = &meta.help {
-        ui.label(
-            RichText::new("?")
-                .color(Color32::from_rgb(40, 128, 168))
-                .small(),
-        )
-        .on_hover_text(help);
-    }
+    // Field documentation is shown on hover over the name label (see
+    // `foundation_label_cell`); this only surfaces the read-only marker.
     if meta.read_only {
         ui.label(RichText::new("read-only").color(subtle_dark()).small());
     }
@@ -1668,7 +2168,10 @@ pub(super) fn draw_bitmap_preview(
     preview: &mut BitmapPreviewState,
 ) {
     if preview.decoded.is_none() {
-        preview.decoded = Some(build_bitmap_preview(tag).map_err(|error| error.to_string()));
+        preview.decoded = Some(
+            build_bitmap_preview(tag, preview.image_index, preview.mip_index)
+                .map_err(|error| error.to_string()),
+        );
         preview.texture_dirty = true;
     }
 
@@ -1692,20 +2195,101 @@ pub(super) fn draw_bitmap_preview(
             preview.texture_dirty = true;
         }
     });
+    // Deferred re-decode: index fields are disjoint from `decoded` so we can
+    // write them now, but `decoded = None` must wait until `data`'s borrow ends
+    // (applied at the end of the function).
+    let mut redecode = false;
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Image 0").color(subtle_dark()));
+        // Image (sequence) selector.
+        if data.image_count > 1 {
+            ui.label(RichText::new("Image").color(subtle_dark()));
+            if ui
+                .add_enabled(preview.image_index > 0, egui::Button::new("◀"))
+                .clicked()
+            {
+                preview.image_index -= 1;
+                preview.mip_index = 0;
+                redecode = true;
+            }
+            ui.monospace(
+                RichText::new(format!("{}/{}", preview.image_index, data.image_count - 1))
+                    .color(text_dark()),
+            );
+            if ui
+                .add_enabled(
+                    preview.image_index + 1 < data.image_count,
+                    egui::Button::new("▶"),
+                )
+                .clicked()
+            {
+                preview.image_index += 1;
+                preview.mip_index = 0;
+                redecode = true;
+            }
+            ui.separator();
+        } else {
+            ui.label(RichText::new("Image 0").color(subtle_dark()));
+        }
+        // Mip-level selector.
+        if data.mip_count > 1 {
+            ui.label(RichText::new("Mip").color(subtle_dark()));
+            if ui
+                .add_enabled(preview.mip_index > 0, egui::Button::new("◀"))
+                .clicked()
+            {
+                preview.mip_index -= 1;
+                redecode = true;
+            }
+            ui.monospace(
+                RichText::new(format!("{}/{}", preview.mip_index, data.mip_count - 1))
+                    .color(text_dark()),
+            );
+            if ui
+                .add_enabled(preview.mip_index + 1 < data.mip_count, egui::Button::new("▶"))
+                .clicked()
+            {
+                preview.mip_index += 1;
+                redecode = true;
+            }
+            ui.separator();
+        }
         ui.monospace(RichText::new(format!("{} x {}", data.width, data.height)).color(text_dark()));
         ui.label(RichText::new(&data.format_name).color(subtle_dark()));
         ui.label(RichText::new(&data.type_name).color(subtle_dark()));
-        if data.image_count > 1 {
-            ui.label(RichText::new(format!("{} images", data.image_count)).color(subtle_dark()));
-        }
         ui.separator();
         ui.label(RichText::new(format!("Zoom {:.0}%", preview.zoom * 100.0)).color(subtle_dark()));
+        egui::ComboBox::from_id_salt(("bitmap_zoom_preset", &entry.key))
+            .selected_text("Set…")
+            .width(58.0)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(false, "Fit").clicked() {
+                    preview.zoom_initialized = false; // refit next frame
+                    preview.pan = Vec2::ZERO;
+                }
+                for pct in [25u32, 50, 100, 200, 400] {
+                    if ui.selectable_label(false, format!("{pct}%")).clicked() {
+                        preview.zoom = pct as f32 / 100.0;
+                        preview.zoom_initialized = true;
+                        preview.pan = Vec2::ZERO;
+                    }
+                }
+            });
         if ui.button("Reset zoom").clicked() {
             preview.zoom_initialized = false; // triggers fit-to-view on next frame
             preview.pan = Vec2::ZERO;
         }
+        ui.separator();
+        ui.label(RichText::new("BG").color(subtle_dark()));
+        egui::ComboBox::from_id_salt(("bitmap_bg", &entry.key))
+            .selected_text(preview.bg.label())
+            .width(86.0)
+            .show_ui(ui, |ui| {
+                for bg in BitmapPreviewBg::ALL {
+                    if ui.selectable_label(preview.bg == bg, bg.label()).clicked() {
+                        preview.bg = bg;
+                    }
+                }
+            });
     });
     ui.add_space(6.0);
 
@@ -1803,7 +2387,7 @@ pub(super) fn draw_bitmap_preview(
 
     // Draw: dark background, then the image clipped to the canvas.
     let painter = ui.painter();
-    painter.rect_filled(canvas_rect, 0.0, Color32::from_rgb(64, 64, 64));
+    painter.rect_filled(canvas_rect, 0.0, preview.bg.color());
     painter.rect_stroke(canvas_rect, 0.0, Stroke::new(1.0, grid_line()));
 
     let img_tl = canvas_rect.center() + preview.pan - draw_size * 0.5;
@@ -1814,36 +2398,170 @@ pub(super) fn draw_bitmap_preview(
         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
         Color32::WHITE,
     );
+
+    // Under-cursor pixel coordinate + RGBA readout (samples the original
+    // decoded pixels, independent of the channel-view toggles).
+    if let Some(ptr) = canvas_resp.hover_pos() {
+        let img_px = (ptr - img_tl) / preview.zoom;
+        let (px, py) = (img_px.x.floor() as i64, img_px.y.floor() as i64);
+        if px >= 0 && py >= 0 && (px as u32) < data.width && (py as u32) < data.height {
+            let idx = (py as usize * data.width as usize + px as usize) * 4;
+            if let Some(rgba) = data.rgba.get(idx..idx + 4) {
+                let (r, g, b, a) = (rgba[0], rgba[1], rgba[2], rgba[3]);
+                let text = format!("({px}, {py})  R{r} G{g} B{b} A{a}");
+                let font = egui::FontId::monospace(12.0);
+                let galley = painter.layout_no_wrap(text.clone(), font.clone(), text_dark());
+                let pad = 5.0;
+                let swatch = 12.0;
+                let box_w = pad + swatch + 6.0 + galley.size().x + pad;
+                let box_h = galley.size().y.max(swatch) + pad * 2.0;
+                let box_min =
+                    egui::pos2(canvas_rect.left() + 6.0, canvas_rect.bottom() - box_h - 6.0);
+                let box_rect = egui::Rect::from_min_size(box_min, egui::vec2(box_w, box_h));
+                painter.rect_filled(box_rect, 3.0, Color32::from_black_alpha(190));
+                let swatch_rect = egui::Rect::from_min_size(
+                    box_min + egui::vec2(pad, (box_h - swatch) * 0.5),
+                    egui::vec2(swatch, swatch),
+                );
+                painter.rect_filled(swatch_rect, 2.0, Color32::from_rgb(r, g, b));
+                painter.rect_stroke(swatch_rect, 2.0, Stroke::new(1.0, grid_line()));
+                painter.text(
+                    swatch_rect.right_center() + egui::vec2(6.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    text,
+                    font,
+                    text_dark(),
+                );
+            }
+        }
+    }
+
+    // Apply a deferred image/mip change now that `data`'s borrow has ended.
+    if redecode {
+        preview.decoded = None;
+        preview.texture_dirty = true;
+    }
 }
 
-pub(super) fn build_bitmap_preview(tag: &TagFile) -> anyhow::Result<BitmapPreviewData> {
+/// Field-aware diff of two same-group tags: walk both root structs in parallel
+/// (same layout → same field order) and collect every differing leaf value plus
+/// block element-count mismatches. Returns the diffs and whether the cap was hit.
+pub(super) fn diff_tags(
+    a: &TagFile,
+    b: &TagFile,
+    names: &TagNameIndex,
+    limit: usize,
+) -> (Vec<TagFieldDiff>, bool) {
+    let mut out = Vec::new();
+    diff_structs(&a.root(), &b.root(), "", names, &mut out, limit);
+    let truncated = out.len() > limit;
+    out.truncate(limit);
+    (out, truncated)
+}
+
+fn diff_structs(
+    a: &TagStruct<'_>,
+    b: &TagStruct<'_>,
+    path: &str,
+    names: &TagNameIndex,
+    out: &mut Vec<TagFieldDiff>,
+    limit: usize,
+) {
+    for (fa, fb) in a.fields_all().zip(b.fields_all()) {
+        if out.len() > limit {
+            return;
+        }
+        let field_path = append_field_path(path, fa.name());
+        if let (Some(ba), Some(bb)) = (fa.as_block(), fb.as_block()) {
+            if ba.len() != bb.len() {
+                out.push(TagFieldDiff {
+                    path: field_path.clone(),
+                    a: format!("{} element(s)", ba.len()),
+                    b: format!("{} element(s)", bb.len()),
+                });
+            }
+            for i in 0..ba.len().min(bb.len()) {
+                if let (Some(ea), Some(eb)) = (ba.element(i), bb.element(i)) {
+                    diff_structs(&ea, &eb, &format!("{field_path}[{i}]"), names, out, limit);
+                }
+            }
+        } else if let (Some(aa), Some(ab)) = (fa.as_array(), fb.as_array()) {
+            for i in 0..aa.len().min(ab.len()) {
+                if let (Some(ea), Some(eb)) = (aa.element(i), ab.element(i)) {
+                    diff_structs(&ea, &eb, &format!("{field_path}[{i}]"), names, out, limit);
+                }
+            }
+        } else if let (Some(sa), Some(sb)) = (fa.as_struct(), fb.as_struct()) {
+            diff_structs(&sa, &sb, &field_path, names, out, limit);
+        } else if let (Some(va), Some(vb)) = (fa.value(), fb.value()) {
+            let ta = foundation::format_foundation_scalar_value(names, &va);
+            let tb = foundation::format_foundation_scalar_value(names, &vb);
+            if ta != tb {
+                out.push(TagFieldDiff {
+                    path: field_path,
+                    a: ta,
+                    b: tb,
+                });
+            }
+        }
+    }
+}
+
+pub(super) fn build_bitmap_preview(
+    tag: &TagFile,
+    image_index: usize,
+    mip_index: usize,
+) -> anyhow::Result<BitmapPreviewData> {
     let bitmap = Bitmap::new(tag)?;
     if bitmap.is_empty() {
         anyhow::bail!("bitmap tag has no images");
     }
+    let image_count = bitmap.len();
+    let image_index = image_index.min(image_count - 1);
     let image = bitmap
-        .image(0)
-        .ok_or_else(|| anyhow::anyhow!("bitmap tag has no image 0"))?;
+        .image(image_index)
+        .ok_or_else(|| anyhow::anyhow!("bitmap tag has no image {image_index}"))?;
     let format = image.format()?;
-    let width = image.width();
-    let height = image.height();
-    if width == 0 || height == 0 {
+    let base_width = image.width();
+    let base_height = image.height();
+    if base_width == 0 || base_height == 0 {
         anyhow::bail!("bitmap image has empty dimensions");
     }
+    let mip_count = (image.mipmap_levels() as usize).max(1);
+    let mip = mip_index.min(mip_count - 1);
+
+    // Walk the face-0 mip chain to this level: offset = Σ smaller-level bytes,
+    // dims halve each step (floored at 1). Layout is `[face0_mips … faceN_mips]`,
+    // so face 0's chain starts at offset 0.
+    let mut offset = 0usize;
+    let (mut width, mut height) = (base_width, base_height);
+    for _ in 0..mip {
+        offset += format.level_bytes(width, height) as usize;
+        width = (width / 2).max(1);
+        height = (height / 2).max(1);
+    }
+    let mip_len = format.level_bytes(width, height) as usize;
+
     let pixel_bytes = image.pixel_bytes()?;
-    let mip0_len = format.level_bytes(width, height) as usize;
-    if pixel_bytes.len() < mip0_len {
+    if pixel_bytes.len() < offset + mip_len {
         anyhow::bail!(
-            "bitmap image mip 0 needs {} bytes but only {} were available",
-            mip0_len,
+            "bitmap image mip {mip} needs {} bytes at offset {offset} but only {} were available",
+            mip_len,
             pixel_bytes.len()
         );
     }
-    let rgba = decode_to_rgba8(format, width, height, &pixel_bytes[..mip0_len])?;
+    let rgba = decode_to_rgba8(
+        format,
+        width,
+        height,
+        &pixel_bytes[offset..offset + mip_len],
+        bitmap.p8_palette(),
+    )?;
     Ok(BitmapPreviewData {
         width,
         height,
-        image_count: bitmap.len(),
+        image_count,
+        mip_count,
         format_name: image.format_name().unwrap_or_else(|| format!("{format:?}")),
         type_name: image.type_name().unwrap_or_else(|| "2D texture".to_owned()),
         rgba,
@@ -1877,6 +2595,222 @@ pub(super) fn filtered_bitmap_rgba(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sound_classes_summary_reads_modern_and_classic_layouts() {
+        // Modern (Reach): scalar distances nested under "distance parameters".
+        let mut tag = TagFile::new("definitions/haloreach_mcc/sound_classes.json").unwrap();
+        add_block_element(&mut tag, "sound classes").unwrap();
+        let classes = tag
+            .root()
+            .field("sound classes")
+            .and_then(|field| field.as_block())
+            .unwrap();
+        let element = classes.element(0).unwrap();
+        assert!(
+            element.descend("distance parameters").is_some(),
+            "Reach nests distances under `distance parameters`"
+        );
+        assert_ne!(
+            sound_class_distance_row(&element).near,
+            "—",
+            "Reach `minimum distance` field name should resolve"
+        );
+
+        // Classic (H3): `distance bounds` real_bounds directly on the entry.
+        let mut tag = TagFile::new("definitions/halo3_mcc/sound_classes.json").unwrap();
+        add_block_element(&mut tag, "sound classes").unwrap();
+        let classes = tag
+            .root()
+            .field("sound classes")
+            .and_then(|field| field.as_block())
+            .unwrap();
+        let element = classes.element(0).unwrap();
+        assert!(
+            element.descend("distance parameters").is_none(),
+            "H3 has no `distance parameters` struct"
+        );
+        assert!(
+            element.field("distance bounds").is_some(),
+            "H3 keeps `distance bounds` directly on the entry"
+        );
+        assert_ne!(sound_class_distance_row(&element).near, "—");
+    }
+
+    #[test]
+    fn material_effects_summary_walks_effects_and_materials_cross_game() {
+        // CE: effect → `materials` block with `effect` + `sound` tag references.
+        let mut tag = TagFile::new("definitions/haloce_mcc/material_effects.json").unwrap();
+        add_block_element(&mut tag, "effects").unwrap();
+        add_block_element(&mut tag, "effects[0]/materials").unwrap();
+        let materials = tag
+            .root()
+            .field_path("effects[0]/materials")
+            .and_then(|field| field.as_block())
+            .unwrap();
+        let material = materials.element(0).unwrap();
+        assert!(find_full_field_name(&material, "effect").is_some());
+        assert!(find_full_field_name(&material, "sound").is_some());
+
+        // Modern (H3): effect → `sounds` block; materials use a `tag (effect or
+        // sound)` reference and a `material name` string_id.
+        let mut tag = TagFile::new("definitions/halo3_mcc/material_effects.json").unwrap();
+        add_block_element(&mut tag, "effects").unwrap();
+        let effects = tag
+            .root()
+            .field("effects")
+            .and_then(|field| field.as_block())
+            .unwrap();
+        let effect = effects.element(0).unwrap();
+        let labels: Vec<String> = block_fields(&effect)
+            .into_iter()
+            .map(|(label, _)| label.to_ascii_lowercase())
+            .collect();
+        assert!(
+            labels.iter().any(|label| label.contains("sound")),
+            "modern effect has a `sounds` material sub-block"
+        );
+        assert!(
+            labels.iter().any(|label| label.contains("old")),
+            "modern effect still declares the deprecated `old materials` block"
+        );
+        add_block_element(&mut tag, "effects[0]/sounds").unwrap();
+        let sounds = tag
+            .root()
+            .field_path("effects[0]/sounds")
+            .and_then(|field| field.as_block())
+            .unwrap();
+        let material = sounds.element(0).unwrap();
+        assert!(
+            material
+                .field_names()
+                .any(|name| name.contains("tag (effect or sound)")),
+            "modern material carries a `tag (effect or sound)` reference"
+        );
+        assert!(
+            find_field_name_containing(&material, "material name").is_some(),
+            "modern material carries a `material name` field"
+        );
+    }
+
+    #[test]
+    fn dialogue_summary_detects_direct_vs_nested_and_classic() {
+        // Classic CE: no vocalizations block (flat per-context fields).
+        let tag = TagFile::new("definitions/haloce_mcc/dialogue.json").unwrap();
+        assert!(
+            find_block_field(&tag.root(), "vocali").is_none(),
+            "CE has no vocalizations block"
+        );
+
+        // H3/ODST: `sound` reference directly on the vocalization.
+        let mut tag = TagFile::new("definitions/halo3_mcc/dialogue.json").unwrap();
+        add_block_element(&mut tag, "vocalizations").unwrap();
+        let vocals = tag
+            .root()
+            .field("vocalizations")
+            .and_then(|field| field.as_block())
+            .unwrap();
+        let vocal = vocals.element(0).unwrap();
+        assert!(
+            find_full_field_name(&vocal, "sound").is_some(),
+            "H3 keeps `sound` directly on the vocalization"
+        );
+        assert!(
+            find_block_field(&vocal, "stimul").is_none(),
+            "H3 has no stimuli sub-block"
+        );
+
+        // Reach/H4/H2A: `sound` nested under a per-vocalization `stimuli` block.
+        let mut tag = TagFile::new("definitions/haloreach_mcc/dialogue.json").unwrap();
+        add_block_element(&mut tag, "vocalizations").unwrap();
+        let vocals = tag
+            .root()
+            .field("vocalizations")
+            .and_then(|field| field.as_block())
+            .unwrap();
+        let vocal = vocals.element(0).unwrap();
+        assert!(
+            find_block_field(&vocal, "stimul").is_some(),
+            "Reach nests sounds under a `stimuli` block"
+        );
+        assert!(
+            find_full_field_name(&vocal, "sound").is_none(),
+            "Reach vocalization has no direct `sound` field"
+        );
+    }
+
+    #[test]
+    fn field_meta_separates_range_from_unit_and_suffix_shows_both() {
+        // Range in the unit slot: unit is empty, range captured; suffix shows
+        // the type (no unit) followed by the range.
+        let m = field_display_meta("acceleration scale:[0,+inf]#marine 1.0, grunt 1.4");
+        assert_eq!(m.label, "acceleration scale");
+        assert_eq!(m.unit, None);
+        assert_eq!(m.range.as_deref(), Some("[0,+inf]"));
+        assert_eq!(m.help.as_deref(), Some("marine 1.0, grunt 1.4"));
+        assert_eq!(field_suffix(&m, "real"), "real [0,+inf]");
+
+        // Range bare in the name (no colon): pulled out of the label.
+        let m = field_display_meta("max sounds per tag [1,16]#max sounds");
+        assert_eq!(m.label, "max sounds per tag");
+        assert_eq!(m.range.as_deref(), Some("[1,16]"));
+        assert_eq!(field_suffix(&m, "long_integer"), "long integer [1,16]");
+
+        // Real unit, no range: unit wins over the type, no range appended.
+        let m = field_display_meta("preemption time:ms#replaces after this many ms");
+        assert_eq!(m.unit.as_deref(), Some("ms"));
+        assert_eq!(m.range, None);
+        assert_eq!(field_suffix(&m, "short_integer"), "ms");
+
+        // Unit AND range together: unit first, then range.
+        let m = field_display_meta("auto-exposure delay:[0.1-1]seconds#how long");
+        assert_eq!(m.unit.as_deref(), Some("seconds"));
+        assert_eq!(m.range.as_deref(), Some("[0.1-1]"));
+        assert_eq!(field_suffix(&m, "real"), "seconds [0.1-1]");
+    }
+
+    #[test]
+    fn new_tags_strip_doc_strings_and_explanations_on_write() {
+        // The engine strips explanation fields + cleans field names when building
+        // a layout from JSON, so a freshly-created tag's embedded blay matches
+        // shipped tags — no `#help`/`:units` text, no explanation bodies.
+        let tag = TagFile::new("definitions/haloreach_mcc/sound_classes.json").unwrap();
+        let bytes = tag.write_to_bytes().unwrap();
+        let contains = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+        assert!(!contains(b"attenuating"), "must not embed explanation/help text");
+        assert!(!contains(b"world units"), "must not embed `:units` annotations");
+        // And it must still round-trip cleanly.
+        TagFile::read_from_bytes(&bytes).expect("stripped tag must parse");
+    }
+
+    #[test]
+    fn block_to_tsv_exports_header_and_one_row_per_element() {
+        let mut tag = TagFile::new("definitions/halo2_mcc/model.json").unwrap();
+        let mut dirty = false;
+        for name in ["alpha", "beta"] {
+            apply_model_variant_ops(
+                &mut tag,
+                vec![ModelVariantOp::Create {
+                    name: name.to_owned(),
+                    regions: Vec::new(),
+                }],
+                &mut dirty,
+            );
+        }
+        let variants = tag
+            .root()
+            .field("variants")
+            .and_then(|field| field.as_block())
+            .unwrap();
+        let tsv = super::block_to_tsv(&variants, &TagNameIndex::default());
+        let lines: Vec<&str> = tsv.lines().collect();
+        assert_eq!(lines.len(), 3, "header + 2 element rows");
+        assert!(
+            lines[0].split('\t').any(|col| col == "name"),
+            "header should include the `name` column"
+        );
+        assert!(tsv.contains("alpha") && tsv.contains("beta"));
+    }
 
     #[test]
     fn model_variant_ops_create_update_and_drop_regions() {
@@ -2060,6 +2994,35 @@ mod tests {
         assert_eq!(
             permutation.read_string_id("permutation name").as_deref(),
             Some(permutation_name)
+        );
+    }
+}
+
+
+
+
+
+
+
+#[cfg(test)]
+mod tag_diff_tests {
+    use super::*;
+
+    #[test]
+    fn diff_detects_value_and_block_count_changes() {
+        let names = TagNameIndex::default();
+        let a = TagFile::new("definitions/halo3_mcc/sound_classes.json").unwrap();
+        let mut b = TagFile::new("definitions/halo3_mcc/sound_classes.json").unwrap();
+        // Two freshly-created identical tags must report no differences.
+        let (diffs, truncated) = diff_tags(&a, &b, &names, 5000);
+        assert!(diffs.is_empty(), "identical tags should have no diffs");
+        assert!(!truncated);
+        // Adding a block element to one shows up as an element-count difference.
+        add_block_element(&mut b, "sound classes").unwrap();
+        let (diffs, _) = diff_tags(&a, &b, &names, 5000);
+        assert!(
+            diffs.iter().any(|d| d.path.contains("sound classes")),
+            "block element-count difference should be reported"
         );
     }
 }

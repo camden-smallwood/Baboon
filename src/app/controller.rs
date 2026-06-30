@@ -20,6 +20,46 @@ impl Baboon {
                         Err(error) => format!("Update check failed: {error}"),
                     };
                 }
+                WorkerMessage::FieldValueSearchFinished {
+                    generation,
+                    query,
+                    result,
+                } => {
+                    self.field_value_searching = false;
+                    // Discard results from a source that has since been reloaded.
+                    if generation != self.source_generation {
+                        continue;
+                    }
+                    match result {
+                        Ok(matches) => {
+                            let entries: Vec<TagEntry> =
+                                matches.iter().map(|m| m.entry.clone()).collect();
+                            let annotations: Vec<String> =
+                                matches.iter().map(|m| m.label.clone()).collect();
+                            let note = entries.is_empty().then(|| {
+                                format!("No tag field values contain \"{query}\".")
+                            });
+                            self.status = format!(
+                                "Field search for \"{query}\": {} match(es)",
+                                entries.len()
+                            );
+                            self.query_results = Some(TagQueryResults {
+                                title: format!("Field value '{query}' ({})", entries.len()),
+                                entries,
+                                annotations,
+                                note,
+                            });
+                        }
+                        Err(error) => {
+                            self.status = format!("Field search failed: {error}");
+                        }
+                    }
+                }
+                WorkerMessage::FieldIndexBuilt { generation, blobs } => {
+                    if generation == self.source_generation {
+                        self.field_index.install(generation, blobs);
+                    }
+                }
                 WorkerMessage::SourceLoaded {
                     result: Ok(mut loaded),
                     recent_path,
@@ -62,6 +102,10 @@ impl Baboon {
                         self.parsed_tags.insert(key, TagDocument::clean(tag));
                     }
                     self.status = loaded_source_status(&loaded);
+                    // Load this game's keyword sidecar (external to the tags).
+                    self.keywords.load_for_game(loaded.game.as_deref());
+                    // The field-value index is bound to the old entry set.
+                    self.field_index.invalidate();
                     self.source = Some(loaded);
                     // New entry universe — invalidate any cached search results.
                     self.source_generation = self.source_generation.wrapping_add(1);
@@ -902,6 +946,9 @@ impl Baboon {
             BrowserAction::ExtractHlslIncludeFolder(keys) => {
                 self.begin_extract_hlsl_include_folder(keys, ctx)
             }
+            BrowserAction::RenameTag(key) => self.open_rename_tag(&key),
+            BrowserAction::FindReferences(key) => self.show_references_for(&key),
+            BrowserAction::ExploreReferences(key) => self.open_content_explorer(&key),
         }
     }
 
@@ -1489,13 +1536,730 @@ impl Baboon {
         Ok(source.all_entries.clone())
     }
 
+    /// Tags that reference `entry` (its "parents"), via the reverse-dependency
+    /// index. `None` when no index is available (non-folder source or not yet
+    /// scanned).
+    /// Open the rename/move dialog for a tag, pre-listing the tags that
+    /// reference it (which will be rewritten on apply).
+    pub(super) fn open_rename_tag(&mut self, key: &str) {
+        let Some(entry) = self.entry_for_key(key).cloned() else {
+            return;
+        };
+        if !matches!(entry.location, TagEntryLocation::LooseFile(_)) {
+            self.status = "Only loose-folder tags can be renamed/moved".to_owned();
+            return;
+        }
+        let display = entry.display_path.replace('\\', "/");
+        let (stem, extension) = match display.rsplit_once('.') {
+            Some((stem, ext)) => (stem.to_owned(), ext.to_owned()),
+            None => (display.clone(), String::new()),
+        };
+        let (referrers, referrers_unavailable) = match self.references_to_entry(&entry) {
+            Some(list) => (
+                list.iter()
+                    .map(|e| e.display_path.replace('\\', "/"))
+                    .collect(),
+                false,
+            ),
+            None => (Vec::new(), true),
+        };
+        self.rename_tag = Some(RenameTagState {
+            key: entry.key.clone(),
+            group_tag: entry.group_tag,
+            old_display: display,
+            extension,
+            new_path_input: stem,
+            referrers,
+            referrers_unavailable,
+        });
+    }
+
+    /// Apply the rename/move: move the file on disk and rewrite every
+    /// referencing tag, in the background (reuses the folder-refactor pipeline).
+    pub(super) fn begin_rename_tag(&mut self) {
+        let Some(state) = self.rename_tag.as_ref() else {
+            return;
+        };
+        if self.folder_refactor.is_some() {
+            self.status = "A move/rename is already running".to_owned();
+            return;
+        }
+        if self.parsed_tags.values().any(|doc| doc.dirty) {
+            self.status = "Save or close dirty tags before renaming".to_owned();
+            return;
+        }
+        let Some(root) = self.loaded_tags_root() else {
+            self.status = "Rename requires a loaded tags folder".to_owned();
+            return;
+        };
+        let new_rel = state
+            .new_path_input
+            .trim()
+            .trim_matches(['/', '\\'])
+            .to_owned();
+        if new_rel.is_empty() {
+            self.status = "Enter a destination path".to_owned();
+            return;
+        }
+        let Some(entry) = self.entry_for_key(&state.key).cloned() else {
+            self.status = "Tag no longer exists".to_owned();
+            return;
+        };
+        let names = self.names.clone();
+        let game = self.source.as_ref().and_then(|source| source.game.clone());
+        let all_entries = self
+            .source
+            .as_ref()
+            .map(|source| source.all_entries.clone())
+            .unwrap_or_default();
+        let reverse_dependencies = self
+            .source
+            .as_ref()
+            .and_then(|source| source.reverse_dependencies.clone());
+        let tx = self.tx.clone();
+        self.folder_refactor = Some(FolderRefactorUiState {
+            label: "Renaming tag".to_owned(),
+            phase: "Preparing".to_owned(),
+            progress: None,
+        });
+        self.status = "Renaming tag: Preparing".to_owned();
+        self.rename_tag = None;
+        thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_tag_rename_job(
+                    root,
+                    entry,
+                    new_rel,
+                    names,
+                    game,
+                    all_entries,
+                    reverse_dependencies,
+                    &tx,
+                )
+            }))
+            .unwrap_or_else(|_| Err("Rename worker crashed".to_owned()));
+            let _ = tx.send(WorkerMessage::FolderRefactorFinished(result));
+        });
+    }
+
+    pub(super) fn references_to_entry(&self, entry: &TagEntry) -> Option<Vec<TagEntry>> {
+        let source = self.source.as_ref()?;
+        let index = source.reverse_dependencies.as_ref()?;
+        let rel = dependency_entry_reference_path(entry, &self.names)?;
+        let referrer_keys = index.dependents_for(entry.group_tag, &rel);
+        let mut out: Vec<TagEntry> = referrer_keys
+            .iter()
+            .filter_map(|key| source.all_entries.iter().find(|e| &e.key == key).cloned())
+            .collect();
+        out.sort_by(|a, b| natural_entry_order(a).cmp(&natural_entry_order(b)));
+        Some(out)
+    }
+
+    /// All tags that nothing references (orphans / roots). `None` when no index
+    /// is available.
+    pub(super) fn unreferenced_entries(&self) -> Option<Vec<TagEntry>> {
+        let source = self.source.as_ref()?;
+        let index = source.reverse_dependencies.as_ref()?;
+        let mut out: Vec<TagEntry> = source
+            .all_entries
+            .iter()
+            .filter(|entry| {
+                dependency_entry_reference_path(entry, &self.names)
+                    .map(|rel| index.dependents_for(entry.group_tag, &rel).is_empty())
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| natural_entry_order(a).cmp(&natural_entry_order(b)));
+        Some(out)
+    }
+
+    /// Resolve the dependencies a tag declares (children) into browseable
+    /// entries, via a one-shot dependency-key → entry lookup over all entries.
+    fn children_of_entry(&self, key: &str) -> (Vec<TagEntry>, bool) {
+        let Some(source) = self.source.as_ref() else {
+            return (Vec::new(), true);
+        };
+        let Some(index) = source.reverse_dependencies.as_ref() else {
+            return (Vec::new(), true);
+        };
+        let deps = index.dependencies_of(key);
+        let mut by_key: HashMap<String, &TagEntry> = HashMap::new();
+        for entry in &source.all_entries {
+            if let Some(rel) = dependency_entry_reference_path(entry, &self.names) {
+                by_key
+                    .entry(crate::source::dependency_key(entry.group_tag, &rel))
+                    .or_insert(entry);
+            }
+        }
+        let mut children: Vec<TagEntry> = deps
+            .iter()
+            .filter_map(|dep| {
+                by_key
+                    .get(&crate::source::dependency_key(dep.group_tag, &dep.rel_path))
+                    .map(|entry| (*entry).clone())
+            })
+            .collect();
+        children.sort_by(|a, b| natural_entry_order(a).cmp(&natural_entry_order(b)));
+        children.dedup_by(|a, b| a.key == b.key);
+        (children, false)
+    }
+
+    /// Open the Content Explorer centered on `key`.
+    pub(super) fn open_content_explorer(&mut self, key: &str) {
+        let Some(focus) = self.entry_for_key(key).cloned() else {
+            return;
+        };
+        let (parents, parents_unavailable) = match self.references_to_entry(&focus) {
+            Some(parents) => (parents, false),
+            None => (Vec::new(), true),
+        };
+        let (children, children_unavailable) = self.children_of_entry(key);
+        self.content_explorer = Some(ContentExplorer {
+            focus,
+            parents,
+            children,
+            filter: String::new(),
+            index_unavailable: parents_unavailable && children_unavailable,
+            back: Vec::new(),
+            forward: Vec::new(),
+        });
+    }
+
+    /// Re-center the open Content Explorer on `entry`, recording history.
+    pub(super) fn content_explorer_navigate(&mut self, entry: TagEntry) {
+        let key = entry.key.clone();
+        let (parents, parents_unavailable) = match self.references_to_entry(&entry) {
+            Some(parents) => (parents, false),
+            None => (Vec::new(), true),
+        };
+        let (children, children_unavailable) = self.children_of_entry(&key);
+        if let Some(explorer) = self.content_explorer.as_mut() {
+            explorer.back.push(explorer.focus.clone());
+            explorer.forward.clear();
+            explorer.focus = entry;
+            explorer.parents = parents;
+            explorer.children = children;
+            explorer.index_unavailable = parents_unavailable && children_unavailable;
+        }
+    }
+
+    pub(super) fn content_explorer_back(&mut self) {
+        let Some(prev) = self
+            .content_explorer
+            .as_mut()
+            .and_then(|explorer| explorer.back.pop())
+        else {
+            return;
+        };
+        self.recenter_explorer(prev, true);
+    }
+
+    pub(super) fn content_explorer_forward(&mut self) {
+        let Some(next) = self
+            .content_explorer
+            .as_mut()
+            .and_then(|explorer| explorer.forward.pop())
+        else {
+            return;
+        };
+        self.recenter_explorer(next, false);
+    }
+
+    /// Re-center without clearing history; pushes the current focus onto the
+    /// opposite stack (used by back/forward).
+    fn recenter_explorer(&mut self, entry: TagEntry, going_back: bool) {
+        let key = entry.key.clone();
+        let (parents, parents_unavailable) = match self.references_to_entry(&entry) {
+            Some(parents) => (parents, false),
+            None => (Vec::new(), true),
+        };
+        let (children, children_unavailable) = self.children_of_entry(&key);
+        if let Some(explorer) = self.content_explorer.as_mut() {
+            let current = std::mem::replace(&mut explorer.focus, entry);
+            if going_back {
+                explorer.forward.push(current);
+            } else {
+                explorer.back.push(current);
+            }
+            explorer.parents = parents;
+            explorer.children = children;
+            explorer.index_unavailable = parents_unavailable && children_unavailable;
+        }
+    }
+
+    pub(super) fn show_references_for(&mut self, key: &str) {
+        let Some(entry) = self.entry_for_key(key).cloned() else {
+            return;
+        };
+        let title = format!("References to {}", entry.display_path.replace('\\', "/"));
+        match self.references_to_entry(&entry) {
+            Some(entries) => {
+                let note = entries
+                    .is_empty()
+                    .then(|| "No other tags reference this tag.".to_owned());
+                self.query_results = Some(TagQueryResults {
+                    title,
+                    entries,
+                    annotations: Vec::new(),
+                    note,
+                });
+            }
+            None => {
+                self.query_results = Some(TagQueryResults {
+                    title,
+                    entries: Vec::new(),
+                    annotations: Vec::new(),
+                    note: Some(
+                        "Reference index unavailable — load a loose-folder source and let it \
+                         finish scanning."
+                            .to_owned(),
+                    ),
+                });
+            }
+        }
+    }
+
+    pub(super) fn show_unreferenced_tags(&mut self) {
+        match self.unreferenced_entries() {
+            Some(entries) => {
+                let note = entries
+                    .is_empty()
+                    .then(|| "Every tag is referenced by at least one other tag.".to_owned());
+                self.query_results = Some(TagQueryResults {
+                    title: format!("Unreferenced tags ({})", entries.len()),
+                    entries,
+                    annotations: Vec::new(),
+                    note,
+                });
+            }
+            None => {
+                self.query_results = Some(TagQueryResults {
+                    title: "Unreferenced tags".to_owned(),
+                    entries: Vec::new(),
+                    annotations: Vec::new(),
+                    note: Some(
+                        "Reference index unavailable — load a loose-folder source and let it \
+                         finish scanning."
+                            .to_owned(),
+                    ),
+                });
+            }
+        }
+    }
+
+    /// Scan every scenario (`scnr`) tag and list its map id (+ map name where
+    /// present). Reads `map id` at the scenario root, which covers the modern
+    /// engines (H2A/H3/ODST/Reach/H4); classic Halo 2 stores it elsewhere.
+    pub(super) fn show_map_ids(&mut self) {
+        let Some(source) = self.source.as_ref() else {
+            self.query_results = Some(TagQueryResults {
+                title: "Scenario map IDs".to_owned(),
+                entries: Vec::new(),
+                annotations: Vec::new(),
+                note: Some("No source loaded.".to_owned()),
+            });
+            return;
+        };
+        let mut entries = Vec::new();
+        let mut annotations = Vec::new();
+        for entry in &source.all_entries {
+            if &entry.group_tag.to_be_bytes() != b"scnr" {
+                continue;
+            }
+            let Ok(tag) = crate::source::read_entry(&source.source, entry) else {
+                continue;
+            };
+            let root = tag.root();
+            if let Some(id) = root.read_int_any("map id") {
+                // `map name` carries a `#tooltip` suffix in Reach/H4, so resolve
+                // it via the cleaned-name lookup rather than an exact match.
+                let name = find_full_field_name(&root, "map name")
+                    .and_then(|full| root.read_string_id(full))
+                    .unwrap_or_default();
+                annotations.push(if name.is_empty() {
+                    format!("map id {id}")
+                } else {
+                    format!("map id {id}  ({name})")
+                });
+                entries.push(entry.clone());
+            }
+        }
+        let note = entries.is_empty().then(|| {
+            "No scenario map IDs found (scnr tags only; classic Halo 2 stores them elsewhere)."
+                .to_owned()
+        });
+        self.query_results = Some(TagQueryResults {
+            title: format!("Scenario map IDs ({})", entries.len()),
+            entries,
+            annotations,
+            note,
+        });
+    }
+
+    /// Locate a tag in the browser tree: switch to Folders mode, clear the
+    /// filter, select it, and request a one-shot force-open + scroll.
+    pub(super) fn reveal_in_browser(&mut self, key: &str) {
+        let Some(entry) = self.entry_for_key(key).cloned() else {
+            return;
+        };
+        self.filter.clear();
+        self.browser_mode = BrowserMode::Folders;
+        self.selected_key = Some(entry.key.clone());
+        self.reveal_target = Some(RevealRequest {
+            key: entry.key.clone(),
+            ancestors: browser::ancestor_labels(&entry.display_path),
+        });
+    }
+
+    /// Run a field-value search for the current query. If the in-memory index is
+    /// ready it answers instantly from cache; otherwise it kicks off a live
+    /// background scan (correct, slower) and builds the index for next time.
+    pub(super) fn begin_field_value_search(&mut self, ctx: egui::Context) {
+        let display = self.field_value_query.trim().to_owned();
+        if display.is_empty() {
+            return;
+        }
+        let query_lower = display.to_ascii_lowercase();
+        let group_filter = self.field_value_group.trim().to_ascii_lowercase();
+        let generation = self.source_generation;
+
+        // Fast path: answer from the cached index.
+        if self.field_index.is_ready_for(generation) {
+            // Over-fetch when group-filtering so the cap applies post-filter.
+            let raw_cap = if group_filter.is_empty() { 1000 } else { 8000 };
+            let hits = self.field_index.query(&query_lower, raw_cap);
+            let mut entries = Vec::new();
+            let mut annotations = Vec::new();
+            for (key, snippet) in hits {
+                if let Some(entry) = self.entry_for_key(&key).cloned() {
+                    if !group_filter.is_empty()
+                        && !self.group_label_matches(entry.group_tag, &group_filter)
+                    {
+                        continue;
+                    }
+                    entries.push(entry);
+                    annotations.push(snippet);
+                    if entries.len() >= 1000 {
+                        break;
+                    }
+                }
+            }
+            let note = entries
+                .is_empty()
+                .then(|| format!("No tag field values contain \"{display}\"."));
+            self.status = format!(
+                "Field search for \"{display}\": {} match(es) (indexed)",
+                entries.len()
+            );
+            self.query_results = Some(TagQueryResults {
+                title: format!("Field value '{display}' ({})", entries.len()),
+                entries,
+                annotations,
+                note,
+            });
+            return;
+        }
+
+        if self.source.is_none() {
+            return;
+        }
+        let base_entries: Vec<TagEntry> = {
+            let source = self.source.as_ref().expect("checked");
+            if source.all_entries.is_empty() {
+                source.entries.clone()
+            } else {
+                source.all_entries.clone()
+            }
+        };
+        let entries: Vec<TagEntry> = if group_filter.is_empty() {
+            base_entries
+        } else {
+            base_entries
+                .into_iter()
+                .filter(|entry| self.group_label_matches(entry.group_tag, &group_filter))
+                .collect()
+        };
+        let tag_source = self.source.as_ref().expect("checked").source.clone();
+        let tx = self.tx.clone();
+        self.field_value_searching = true;
+        self.status = format!("Searching field values for \"{display}\"…");
+        let search_ctx = ctx.clone();
+        thread::spawn(move || {
+            let result = run_field_value_search(&tag_source, &entries, &query_lower);
+            let _ = tx.send(WorkerMessage::FieldValueSearchFinished {
+                generation,
+                query: display,
+                result,
+            });
+            search_ctx.request_repaint();
+        });
+        // Build the index in the background so the next search is instant.
+        self.begin_build_field_index(ctx);
+    }
+
+    /// Whether a group matches a (lowercased) group filter — by four-CC or by a
+    /// substring of the group's name/extension (e.g. "weap" or "weapon").
+    fn group_label_matches(&self, group_tag: u32, filter_lower: &str) -> bool {
+        if format_group_tag(group_tag).to_ascii_lowercase() == filter_lower {
+            return true;
+        }
+        self.names
+            .name_for(group_tag)
+            .or_else(|| group_tag_to_extension(group_tag))
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .contains(filter_lower)
+    }
+
+    /// Build the in-memory searchable-text index in the background (idempotent —
+    /// skips if already ready for this generation or already building).
+    pub(super) fn begin_build_field_index(&mut self, ctx: egui::Context) {
+        let generation = self.source_generation;
+        if self.field_index.is_ready_for(generation) || self.field_index.is_building() {
+            return;
+        }
+        let Some(source) = self.source.as_ref() else {
+            return;
+        };
+        let entries: Vec<TagEntry> = if source.all_entries.is_empty() {
+            source.entries.clone()
+        } else {
+            source.all_entries.clone()
+        };
+        let tag_source = source.source.clone();
+        let tx = self.tx.clone();
+        self.field_index.mark_building();
+        thread::spawn(move || {
+            let blobs = build_field_value_index(&tag_source, &entries);
+            let _ = tx.send(WorkerMessage::FieldIndexBuilt { generation, blobs });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Apply pasted TSV (header row = field names, one data row per element) to
+    /// the target block's EXISTING elements, cell-by-cell via `apply_field_edit`.
+    /// Rows beyond the current element count are reported and ignored (no
+    /// structural changes — fully covered by undo). Returns a status summary.
+    pub(super) fn apply_tsv_paste(&mut self) {
+        let Some(paste) = self.tsv_paste.as_ref() else {
+            return;
+        };
+        let tag_key = paste.tag_key.clone();
+        let block_path = paste.block_path.clone();
+        let text = paste.text.clone();
+
+        let Some(doc) = self.parsed_tags.get_mut(&tag_key) else {
+            self.set_tsv_paste_status("Tag is no longer open.");
+            return;
+        };
+        let Some(block) = doc
+            .tag
+            .root()
+            .field_path(&block_path)
+            .and_then(|field| field.as_block())
+        else {
+            self.set_tsv_paste_status("Block no longer resolves in this tag.");
+            return;
+        };
+        let element_count = block.len();
+        let columns = block_leaf_columns(&block); // (clean, full) per leaf field
+
+        let mut lines = text.lines();
+        let Some(header_line) = lines.next() else {
+            self.set_tsv_paste_status("Nothing to paste.");
+            return;
+        };
+        // Map each pasted column index → the full field name to write.
+        let header_to_full = map_tsv_header_to_fields(header_line, &columns);
+        if header_to_full.iter().all(Option::is_none) {
+            self.set_tsv_paste_status(
+                "No pasted column headers matched this block's fields.",
+            );
+            return;
+        }
+
+        let mut edits = Vec::new();
+        let mut data_rows = 0usize;
+        let mut skipped_rows = 0usize;
+        for (row_index, line) in lines.enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            data_rows += 1;
+            if row_index >= element_count {
+                skipped_rows += 1;
+                continue;
+            }
+            for (col_index, cell) in line.split('\t').enumerate() {
+                if let Some(Some(full)) = header_to_full.get(col_index) {
+                    edits.push(PendingFieldEdit {
+                        path: format!("{block_path}[{row_index}]/{full}"),
+                        input: cell.trim().to_owned(),
+                    });
+                }
+            }
+        }
+
+        if edits.is_empty() {
+            self.set_tsv_paste_status("No editable cells matched.");
+            return;
+        }
+        let edit_count = edits.len();
+        let applied_rows = data_rows.saturating_sub(skipped_rows);
+        doc.journal.begin_edit(&doc.tag, "Paste TSV");
+        let _ = apply_pending_edits(&mut doc.tag, edits, &mut doc.dirty);
+        doc.journal.end_edit_window();
+        self.invalidate_tag_caches(&tag_key);
+
+        let mut summary = format!("Pasted {edit_count} cell(s) across {applied_rows} row(s)");
+        if skipped_rows > 0 {
+            summary.push_str(&format!(
+                " — {skipped_rows} extra row(s) ignored (block has {element_count} elements; add more first)"
+            ));
+        }
+        self.status = summary.clone();
+        self.set_tsv_paste_status(&summary);
+    }
+
+    fn set_tsv_paste_status(&mut self, message: &str) {
+        if let Some(paste) = self.tsv_paste.as_mut() {
+            paste.status = Some(message.to_owned());
+        }
+    }
+
+    /// The documentation overlay (help/units + explanations) for a group,
+    /// parsed once from its definition JSON and cached. `None` when the
+    /// definitions can't be located (e.g. non-loose sources).
+    pub(super) fn def_docs_for_entry(&mut self, entry: &TagEntry) -> Option<Rc<DefDocs>> {
+        let root = match self.source.as_ref().map(|source| &source.source) {
+            Some(TagSource::LooseFolder {
+                definitions_root, ..
+            }) => definitions_root.clone(),
+            _ => return None,
+        };
+        let game = self.source.as_ref().and_then(|source| source.game.clone())?;
+        let group = self
+            .names
+            .name_for(entry.group_tag)
+            .or_else(|| group_tag_to_extension(entry.group_tag))?
+            .to_owned();
+        // Cache key is the group's own JSON path; the docs themselves merge the
+        // whole `parent_tag` inheritance chain (object-family fields live in
+        // parent files).
+        let path = root.join(&game).join(format!("{group}.json"));
+        if let Some(docs) = self.def_docs_cache.get(&path) {
+            return Some(docs.clone());
+        }
+        let docs = Rc::new(build_def_docs(&root, &game, &group));
+        self.def_docs_cache.insert(path, docs.clone());
+        Some(docs)
+    }
+
+    pub(super) fn show_tags_with_keyword(&mut self, keyword: &str) {
+        let keys = self.keywords.tags_with(keyword);
+        let entries: Vec<TagEntry> = keys
+            .iter()
+            .filter_map(|key| self.entry_for_key(key).cloned())
+            .collect();
+        let note = entries
+            .is_empty()
+            .then(|| "No tags with this keyword are in the current source.".to_owned());
+        self.query_results = Some(TagQueryResults {
+            title: format!("Tags tagged '{keyword}' ({})", entries.len()),
+            entries,
+            annotations: Vec::new(),
+            note,
+        });
+    }
+
+    /// Drop cached previews derived from a tag's contents so they rebuild from
+    /// the (newly restored) tag bytes after an undo/redo.
+    pub(super) fn invalidate_tag_caches(&mut self, key: &str) {
+        if let Some(preview) = self.model_previews.get_mut(key) {
+            preview.loaded_key = None;
+            preview.data = None;
+        }
+        if let Some(bitmap) = self.bitmap_previews.get_mut(key) {
+            bitmap.decoded = None;
+            bitmap.texture = None;
+            bitmap.texture_dirty = true;
+        }
+        // rmdf/rmop caches are keyed by external render-method paths, not by this
+        // tag's contents, and the shader grid rebuilds from the tag each frame —
+        // so nothing to clear there.
+    }
+
+    pub(super) fn undo_current_tag(&mut self) {
+        let Some(key) = self.selected_key.clone() else {
+            self.status = "Nothing to undo".to_owned();
+            return;
+        };
+        let restored = self
+            .parsed_tags
+            .get_mut(&key)
+            .and_then(|doc| doc.journal.undo(&doc.tag));
+        self.restore_snapshot(&key, restored, "Undo");
+    }
+
+    pub(super) fn redo_current_tag(&mut self) {
+        let Some(key) = self.selected_key.clone() else {
+            self.status = "Nothing to redo".to_owned();
+            return;
+        };
+        let restored = self
+            .parsed_tags
+            .get_mut(&key)
+            .and_then(|doc| doc.journal.redo(&doc.tag));
+        self.restore_snapshot(&key, restored, "Redo");
+    }
+
+    /// Apply a snapshot returned by the journal: re-parse the bytes into the
+    /// document and invalidate derived caches.
+    fn restore_snapshot(&mut self, key: &str, restored: Option<(Vec<u8>, String)>, verb: &str) {
+        match restored {
+            Some((bytes, label)) => match TagFile::read_from_bytes(&bytes) {
+                Ok(tag) => {
+                    if let Some(doc) = self.parsed_tags.get_mut(key) {
+                        doc.tag = tag;
+                        doc.dirty = true;
+                    }
+                    self.invalidate_tag_caches(key);
+                    self.status = format!("{verb}: {label}");
+                }
+                Err(error) => {
+                    self.status = format!("{verb} failed: {error}");
+                }
+            },
+            None => {
+                self.status = format!("Nothing to {}", verb.to_ascii_lowercase());
+            }
+        }
+    }
+
+    pub(super) fn can_undo_current(&self) -> bool {
+        self.selected_key
+            .as_ref()
+            .and_then(|key| self.parsed_tags.get(key))
+            .is_some_and(|doc| doc.journal.can_undo())
+    }
+
+    pub(super) fn can_redo_current(&self) -> bool {
+        self.selected_key
+            .as_ref()
+            .and_then(|key| self.parsed_tags.get(key))
+            .is_some_and(|doc| doc.journal.can_redo())
+    }
+
     pub(super) fn current_prefs(&self) -> GuiPrefs {
         GuiPrefs {
             browser_mode: self.browser_mode,
+            browser_sort: self.browser_sort,
             show_browser_prefixes: self.show_browser_prefixes,
             double_click_to_open_tags: self.double_click_to_open_tags,
             show_block_sizes: self.show_block_sizes,
             expert_mode: self.expert_mode,
+            field_search_passive: self.field_search_passive,
             dark_mode: self.dark_mode,
             ui_scale: self.ui_scale,
             model_preview_size: self.model_preview_size,
@@ -1716,7 +2480,11 @@ impl Baboon {
                 source.entries.push(entry);
             }
         }
-        self.select_entry(key, ctx.clone());
+        self.select_entry(key.clone(), ctx.clone());
+        // Alt-click requested a floating window: tear the just-opened tab off.
+        if req.float {
+            self.pop_tab(&key);
+        }
     }
 
     /// Run a geometry Import request (`tool render/collision/physics/...`)
@@ -1824,9 +2592,11 @@ impl Baboon {
                         path: confirm.path,
                         kind: confirm.kind,
                     };
+                    doc.journal.begin_edit(&doc.tag, "Block edit");
                     if let Some(status) = apply_block_ops(&mut doc.tag, vec![op], &mut doc.dirty) {
                         self.status = status;
                     }
+                    doc.journal.end_edit_window();
                 }
             }
         } else if do_cancel {
@@ -1863,6 +2633,7 @@ impl Baboon {
             let mut dock_requested = false;
             let mut edit_status = None;
             let mut bitmap_reimport_request = None;
+            let def_docs = self.def_docs_for_entry(&entry);
             let window_response = egui::Window::new(tag_tab_label(&entry))
                 .id(egui::Id::new(("floating_tag", key.clone())))
                 .resizable(true)
@@ -1906,6 +2677,7 @@ impl Baboon {
                     let field_filter = compute_pending_field_filter(
                         &doc.tag,
                         supports_field_search,
+                        self.field_search_passive,
                         &key,
                         &self.field_search,
                         &mut self.field_search_applied,
@@ -1913,10 +2685,12 @@ impl Baboon {
                     let mut color_request = None;
                     let mut function_request = None;
                     let mut block_clip_request = None;
+                    let mut tsv_paste_request = None;
                     let mut edit_context = FieldEditContext {
                         view_scope: "floating",
                         tag_key: &key,
                         group_tag: entry.group_tag,
+                        root: Some(doc.tag.root()),
                         game: self
                             .source
                             .as_ref()
@@ -1957,6 +2731,8 @@ impl Baboon {
                         model_variant_ops: &mut model_variant_ops,
                         color_request: &mut color_request,
                         function_request: &mut function_request,
+                        docs: def_docs.as_deref(),
+                        tsv_paste_request: &mut tsv_paste_request,
                         block_clipboard: self.block_clipboard.as_ref(),
                         block_clip_request: &mut block_clip_request,
                         field_filter: field_filter.as_ref(),
@@ -1997,6 +2773,17 @@ impl Baboon {
                             self.expert_mode,
                             &mut edit_context,
                         );
+                    }
+                    // Undo snapshot before this floating tab's edit batch.
+                    if !pending.is_empty()
+                        || !block_ops.is_empty()
+                        || !shader_ops.is_empty()
+                        || !shader_param_ops.is_empty()
+                        || !model_variant_ops.is_empty()
+                    {
+                        doc.journal.begin_edit(&doc.tag, "Edit");
+                    } else {
+                        doc.journal.end_edit_window();
                     }
                     edit_status = apply_pending_edits(&mut doc.tag, pending, &mut doc.dirty);
                     if let Some(status) = apply_block_ops(&mut doc.tag, block_ops, &mut doc.dirty) {
@@ -2045,6 +2832,17 @@ impl Baboon {
                             clip.label
                         ));
                         self.block_clipboard = Some(clip);
+                    }
+                    // "Paste TSV…" was chosen: open the import window.
+                    if let Some(req) = tsv_paste_request {
+                        self.tsv_paste = Some(TsvPasteState {
+                            tag_key: key.clone(),
+                            block_path: req.block_path,
+                            block_label: req.block_label,
+                            element_count: req.element_count,
+                            text: String::new(),
+                            status: None,
+                        });
                     }
                     bitmap_reimport_request = bitmap_reimport;
                 });
@@ -2510,6 +3308,11 @@ pub(super) fn new_tag_output_path(
     if cleaned.is_empty() {
         return Err("Enter a relative tag path".to_owned());
     }
+    // Tag paths never contain a colon; reject drive prefixes (e.g. `C:/…`)
+    // explicitly since `Component::Prefix` is only produced on Windows.
+    if cleaned.contains(':') {
+        return Err("Tag path cannot contain a drive prefix or ':'".to_owned());
+    }
     let rel = Path::new(cleaned);
     if rel.is_absolute() {
         return Err("Tag path must be relative to the tags folder".to_owned());
@@ -2781,6 +3584,173 @@ fn build_dependency_candidate_index(
     index
 }
 
+/// Read each entry's tag and record the first field whose value contains
+/// `query_lower`. Capped to keep result sets (and runtime) bounded.
+fn run_field_value_search(
+    source: &TagSource,
+    entries: &[TagEntry],
+    query_lower: &str,
+) -> Result<Vec<FieldValueMatch>, String> {
+    const MATCH_CAP: usize = 1000;
+    let mut matches = Vec::new();
+    for entry in entries {
+        if matches.len() >= MATCH_CAP {
+            break;
+        }
+        let Ok(tag) = crate::source::read_entry(source, entry) else {
+            continue; // unreadable / unparseable tag — skip
+        };
+        if let Some((field_path, value)) = first_field_value_match(&tag.root(), query_lower, "") {
+            matches.push(FieldValueMatch {
+                entry: entry.clone(),
+                label: format!("{field_path} = {}", truncate_field_value(&value)),
+            });
+        }
+    }
+    Ok(matches)
+}
+
+/// Map each pasted TSV header column → the full stored field name to write
+/// (matched case-insensitively against the block's cleaned leaf-column names),
+/// or `None` for columns that don't correspond to a writable field.
+fn map_tsv_header_to_fields(
+    header_line: &str,
+    columns: &[(String, String)],
+) -> Vec<Option<String>> {
+    header_line
+        .split('\t')
+        .map(|raw| {
+            let clean = raw.trim();
+            columns
+                .iter()
+                .find(|(col_clean, _)| col_clean.eq_ignore_ascii_case(clean))
+                .map(|(_, full)| full.clone())
+        })
+        .collect()
+}
+
+/// Build the searchable-text index: for each tag, a lowercased blob of all its
+/// string / string_id / reference / enum values. Tags with no searchable text
+/// are omitted.
+fn build_field_value_index(source: &TagSource, entries: &[TagEntry]) -> Vec<(String, String)> {
+    let mut blobs = Vec::new();
+    for entry in entries {
+        let Ok(tag) = crate::source::read_entry(source, entry) else {
+            continue;
+        };
+        let mut blob = String::new();
+        collect_searchable_text(&tag.root(), &mut blob, 0);
+        if !blob.is_empty() {
+            blobs.push((entry.key.clone(), blob));
+        }
+    }
+    blobs
+}
+
+/// Append every leaf field's lowercased searchable text into `blob`, separated
+/// by " · ", bounded in size and recursion depth.
+fn collect_searchable_text(element: &TagStruct, blob: &mut String, depth: usize) {
+    const CAP: usize = 4000;
+    if blob.len() >= CAP || depth > 32 {
+        return;
+    }
+    for field in element.fields() {
+        if blob.len() >= CAP {
+            return;
+        }
+        if let Some(block) = field.as_block() {
+            for index in 0..block.len() {
+                if let Some(child) = block.element(index) {
+                    collect_searchable_text(&child, blob, depth + 1);
+                }
+                if blob.len() >= CAP {
+                    return;
+                }
+            }
+            continue;
+        }
+        if let Some(nested) = field.as_struct() {
+            collect_searchable_text(&nested, blob, depth + 1);
+            continue;
+        }
+        if let Some(text) = field_searchable_text(field.value()) {
+            if !text.is_empty() {
+                if !blob.is_empty() {
+                    blob.push_str(" · ");
+                }
+                blob.push_str(&text.to_ascii_lowercase());
+            }
+        }
+    }
+}
+
+/// Depth-first search for the first field whose searchable text contains
+/// `query_lower`. Returns the cleaned field path and the matched value.
+fn first_field_value_match(
+    element: &TagStruct,
+    query_lower: &str,
+    path: &str,
+) -> Option<(String, String)> {
+    for field in element.fields() {
+        let clean = clean_field_name(field.name());
+        let field_path = if path.is_empty() {
+            clean.clone()
+        } else {
+            format!("{path}/{clean}")
+        };
+        if let Some(block) = field.as_block() {
+            for index in 0..block.len() {
+                if let Some(child) = block.element(index) {
+                    if let Some(hit) = first_field_value_match(
+                        &child,
+                        query_lower,
+                        &format!("{field_path}[{index}]"),
+                    ) {
+                        return Some(hit);
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some(nested) = field.as_struct() {
+            if let Some(hit) = first_field_value_match(&nested, query_lower, &field_path) {
+                return Some(hit);
+            }
+            continue;
+        }
+        if let Some(text) = field_searchable_text(field.value()) {
+            if !text.is_empty() && text.to_ascii_lowercase().contains(query_lower) {
+                return Some((field_path, text));
+            }
+        }
+    }
+    None
+}
+
+/// The user-visible text of a leaf field for searching, or `None` for fields
+/// with no meaningful text (raw numbers, padding, data blobs, …).
+fn field_searchable_text(value: Option<TagFieldData>) -> Option<String> {
+    match value? {
+        TagFieldData::String(s) | TagFieldData::LongString(s) => Some(s),
+        TagFieldData::StringId(d) | TagFieldData::OldStringId(d) => Some(d.string),
+        TagFieldData::TagReference(r) => r.group_tag_and_name.map(|(_, path)| path),
+        TagFieldData::CharEnum { name, .. }
+        | TagFieldData::ShortEnum { name, .. }
+        | TagFieldData::LongEnum { name, .. } => name,
+        _ => None,
+    }
+}
+
+fn truncate_field_value(value: &str) -> String {
+    const MAX: usize = 80;
+    if value.chars().count() > MAX {
+        let head: String = value.chars().take(MAX).collect();
+        format!("{head}…")
+    } else {
+        value.to_owned()
+    }
+}
+
 fn dependency_entry_reference_path(entry: &TagEntry, names: &TagNameIndex) -> Option<String> {
     let extension = names
         .name_for(entry.group_tag)
@@ -2824,6 +3794,190 @@ struct ReferenceRewriteResult {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Rename/move a SINGLE tag and rewrite every reference to it, mirroring
+/// [`run_folder_refactor_job`] for one file with an explicit new relative path
+/// (no extension). Reuses the same reference-rewrite + key-remap machinery and
+/// returns a [`FolderRefactorFinished`] so the existing finish handler applies
+/// the in-memory update.
+#[allow(clippy::too_many_arguments)]
+fn run_tag_rename_job(
+    root: PathBuf,
+    entry: TagEntry,
+    new_rel: String,
+    names: TagNameIndex,
+    game: Option<String>,
+    all_entries_before: Vec<TagEntry>,
+    existing_reverse_dependencies: Option<ReverseDependencyIndex>,
+    tx: &Sender<WorkerMessage>,
+) -> Result<FolderRefactorFinished, String> {
+    let label = "Renaming tag".to_owned();
+    send_folder_refactor_progress(tx, &label, "Preparing", None);
+    let root = lexical_normalize_path(&root);
+
+    let TagEntryLocation::LooseFile(old_path) = &entry.location else {
+        return Err("Only loose-folder tags can be renamed".to_owned());
+    };
+    let old_path = lexical_normalize_path(old_path);
+    if !old_path.is_file() {
+        return Err(format!("Source tag not found: {}", old_path.display()));
+    }
+    let extension = old_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .ok_or_else(|| "Tag file has no extension".to_owned())?
+        .to_owned();
+
+    // Compute the destination absolute path from the (extension-less) new rel.
+    let new_rel_norm = new_rel.replace('\\', "/");
+    if new_rel_norm.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..") {
+        return Err("Destination path is not a valid relative path".to_owned());
+    }
+    let new_path =
+        lexical_normalize_path(&root.join(format!("{new_rel_norm}.{extension}")));
+    if !new_path.starts_with(&root) {
+        return Err("Destination escapes the tags folder".to_owned());
+    }
+    if new_path == old_path {
+        return Err("New path is the same as the current one".to_owned());
+    }
+    if new_path.exists() {
+        return Err(format!(
+            "A tag already exists at the destination: {}",
+            new_path.display()
+        ));
+    }
+
+    // The one rewrite: old reference path → new reference path (same group).
+    let old_ref = reference_path_from_abs_file(&root, &old_path, entry.group_tag, &names)
+        .ok_or_else(|| "Could not resolve the tag's reference path".to_owned())?;
+    let new_ref = reference_path_from_abs_file(&root, &new_path, entry.group_tag, &names)
+        .ok_or_else(|| "Could not resolve the destination reference path".to_owned())?;
+    let mut rewrites = HashMap::new();
+    rewrites.insert((entry.group_tag, old_ref.to_ascii_lowercase()), new_ref);
+
+    // Ensure a reverse-dependency index so we only rewrite actual referrers.
+    let mut reverse_dependencies = existing_reverse_dependencies.or_else(|| {
+        game.as_deref()
+            .and_then(|game| crate::source::load_reverse_dependency_index(game, &root))
+    });
+    if let Some(index) = reverse_dependencies.as_ref()
+        && index.len() != all_entries_before.len()
+    {
+        reverse_dependencies = None; // stale → rebuild below
+    }
+    let dependency_source = TagSource::LooseFolder {
+        root: root.clone(),
+        game: game.clone(),
+        definitions_root: locate_definitions_root(),
+    };
+    if reverse_dependencies.is_none() {
+        reverse_dependencies = Some(build_reverse_dependency_index(
+            &root,
+            &dependency_source,
+            &all_entries_before,
+            &label,
+            tx,
+        ));
+    }
+    let dependency_schema_path = game
+        .as_deref()
+        .map(|game| {
+            locate_definitions_root()
+                .join(game)
+                .join("tag_dependency_list.json")
+        })
+        .filter(|path| path.is_file());
+
+    // The moved entry, post-rename.
+    let new_display = new_path
+        .strip_prefix(&root)
+        .unwrap_or(&new_path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let new_entry = TagEntry {
+        key: format!("file:{}", new_path.display()),
+        display_path: new_display,
+        group_tag: entry.group_tag,
+        group_name: entry.group_name.clone(),
+        location: TagEntryLocation::LooseFile(new_path.clone()),
+    };
+    let old_entries = vec![entry.clone()];
+    let new_entries = vec![new_entry.clone()];
+
+    // Move the file on disk.
+    if let Some(parent) = new_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
+    }
+    fs::rename(&old_path, &new_path).map_err(|error| {
+        format!(
+            "Could not move {} to {}: {error}",
+            old_path.display(),
+            new_path.display()
+        )
+    })?;
+
+    // Rewrite references in the affected (referring) tags.
+    let rewrite_entries = affected_move_rewrite_entries(
+        &all_entries_before,
+        &old_entries,
+        &new_entries,
+        &rewrites,
+        reverse_dependencies.as_ref(),
+    );
+    send_folder_refactor_progress(
+        tx,
+        &label,
+        &format!("Rewriting {} affected tag(s)", rewrite_entries.len()),
+        None,
+    );
+    let rewrite_result = rewrite_references_in_entries(
+        &dependency_source,
+        &rewrite_entries,
+        &rewrites,
+        &label,
+        tx,
+        dependency_schema_path.as_deref(),
+    )?;
+    let references_changed = rewrite_result.references_changed;
+    let tags_changed = rewrite_result.tags_changed;
+
+    // Rebuild browser tree + entry set + key map.
+    send_folder_refactor_progress(tx, &label, "Refreshing browser", None);
+    let tree = crate::source::build_folder_directory_tree(&root).map_err(|e| e.to_string())?;
+    let all_entries = merge_refactored_entries(all_entries_before, &old_entries, &new_entries, true);
+    let mut old_to_new_keys = HashMap::new();
+    old_to_new_keys.insert(entry.key.clone(), new_entry.key.clone());
+    if let Some(index) = reverse_dependencies.as_mut() {
+        refresh_reverse_dependency_index_after_refactor(
+            index,
+            &dependency_source,
+            true,
+            &old_entries,
+            &new_entries,
+            &rewrite_result.changed_keys,
+            &all_entries,
+        );
+    }
+
+    let status = format!(
+        "Renamed tag, updated {references_changed} reference(s) in {tags_changed} tag(s)"
+    );
+    let lines = vec![
+        format!("Renamed: {} -> {}", entry.display_path, new_entry.display_path),
+        format!("Updated {references_changed} reference(s) in {tags_changed} tag(s)"),
+    ];
+    Ok(FolderRefactorFinished {
+        status,
+        lines,
+        tree,
+        all_entries,
+        reverse_dependencies,
+        old_to_new_keys,
+        moved: true,
+    })
+}
+
 fn run_folder_refactor_job(
     root: PathBuf,
     rel_path: PathBuf,
@@ -3574,6 +4728,75 @@ fn reference_path_from_rel_file(
         .with_extension("")
         .to_str()
         .map(|path| path.replace('/', "\\"))
+}
+
+#[cfg(test)]
+mod tsv_paste_tests {
+    use super::*;
+
+    #[test]
+    fn header_maps_case_insensitively_reordered_and_ignores_unknown() {
+        let columns = vec![
+            ("material name".to_owned(), "material name^".to_owned()),
+            ("sweetener mode".to_owned(), "sweetener mode".to_owned()),
+        ];
+        // Reordered, mixed case, plus an unknown column.
+        let mapped = map_tsv_header_to_fields("Sweetener Mode\tbogus\tmaterial name", &columns);
+        assert_eq!(
+            mapped,
+            vec![
+                Some("sweetener mode".to_owned()),
+                None,
+                Some("material name^".to_owned()),
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod field_search_tests {
+    use super::*;
+
+    #[test]
+    fn searchable_text_extracts_text_kinds_only() {
+        assert_eq!(
+            field_searchable_text(Some(TagFieldData::String("Hello".to_owned()))).as_deref(),
+            Some("Hello")
+        );
+        assert_eq!(
+            field_searchable_text(Some(TagFieldData::CharEnum {
+                value: 1,
+                name: Some("alert".to_owned()),
+            }))
+            .as_deref(),
+            Some("alert")
+        );
+        // Numbers / padding carry no searchable text.
+        assert_eq!(field_searchable_text(Some(TagFieldData::LongInteger(42))), None);
+        assert_eq!(field_searchable_text(None), None);
+    }
+
+    #[test]
+    fn first_match_finds_a_string_id_value_and_path() {
+        let mut tag = TagFile::new("definitions/halo2_mcc/model.json").unwrap();
+        let mut dirty = false;
+        apply_model_variant_ops(
+            &mut tag,
+            vec![ModelVariantOp::Create {
+                name: "myhero".to_owned(),
+                regions: Vec::new(),
+            }],
+            &mut dirty,
+        );
+        let hit = first_field_value_match(&tag.root(), "hero", "");
+        let (path, value) = hit.expect("variant name should match 'hero'");
+        assert!(value.to_ascii_lowercase().contains("hero"));
+        assert!(path.to_ascii_lowercase().contains("variant"));
+        assert!(
+            first_field_value_match(&tag.root(), "zzz-not-present", "").is_none(),
+            "absent text should not match"
+        );
+    }
 }
 
 #[cfg(test)]

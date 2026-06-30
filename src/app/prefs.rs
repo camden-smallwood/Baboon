@@ -40,8 +40,14 @@ pub(super) fn load_gui_prefs() -> GuiPrefs {
         Some("groups") => BrowserMode::Groups,
         _ => BrowserMode::Folders,
     };
+    let browser_sort = match value.get("browser_sort").and_then(Value::as_str) {
+        Some("name") => BrowserSort::Name,
+        Some("type") => BrowserSort::Type,
+        _ => BrowserSort::Natural,
+    };
     GuiPrefs {
         browser_mode,
+        browser_sort,
         show_browser_prefixes: value
             .get("show_browser_prefixes")
             .and_then(Value::as_bool)
@@ -56,6 +62,10 @@ pub(super) fn load_gui_prefs() -> GuiPrefs {
             .unwrap_or(false),
         expert_mode: value
             .get("expert_mode")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        field_search_passive: value
+            .get("field_search_passive")
             .and_then(Value::as_bool)
             .unwrap_or(false),
         dark_mode: value
@@ -246,10 +256,16 @@ pub(super) fn save_gui_prefs(
             BrowserMode::Folders => "folders",
             BrowserMode::Groups => "groups",
         },
+        "browser_sort": match prefs.browser_sort {
+            BrowserSort::Natural => "natural",
+            BrowserSort::Name => "name",
+            BrowserSort::Type => "type",
+        },
         "show_browser_prefixes": prefs.show_browser_prefixes,
         "double_click_to_open_tags": prefs.double_click_to_open_tags,
         "show_block_sizes": prefs.show_block_sizes,
         "expert_mode": prefs.expert_mode,
+        "field_search_passive": prefs.field_search_passive,
         "dark_mode": prefs.dark_mode,
         "ui_scale": prefs.ui_scale,
         "model_preview_size": prefs.model_preview_size,

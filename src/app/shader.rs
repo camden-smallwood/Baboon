@@ -22,6 +22,10 @@ pub(super) struct ShaderGridRow {
     value_cell: ShaderGridCell,
     fill: Color32,
     parameter_type: Option<String>,
+    /// True when this row is backed by an explicit shader parameter/template
+    /// instance. False means the visible value is inherited from the
+    /// render-method option or H2 shader-template default.
+    is_overridden: bool,
     function: Option<FunctionView>,
     /// When present, the value cell is rendered as an editable widget that
     /// writes back to this tag field path (instead of a read-only label).
@@ -1266,6 +1270,7 @@ fn h2_template_base_parameter_row(
         },
         fill,
         parameter_type: Some(parameter_type_label.to_owned()),
+        is_overridden: instance.is_some(),
         function: None,
         edit,
         context_menu: None,
@@ -1499,6 +1504,7 @@ fn h2_function_template_row(
                 },
                 fill: material_numeric_row(),
                 parameter_type: Some("color".to_owned()),
+                is_overridden: true,
                 function: None,
                 edit: (!block_path.is_empty()).then(|| ShaderRowEdit {
                     path: block_path.clone(),
@@ -1545,6 +1551,7 @@ fn h2_function_template_row(
             value_cell: shader_value_cell(format!("value: {current}")),
             fill: material_numeric_row(),
             parameter_type: Some("animated scalar".to_owned()),
+            is_overridden: true,
             function: None,
             edit: (!block_path.is_empty()).then(|| ShaderRowEdit {
                 path: block_path.clone(),
@@ -1618,6 +1625,7 @@ fn h2_legacy_animation_constant_row(
             },
             fill: material_numeric_row(),
             parameter_type: Some("color".to_owned()),
+            is_overridden: true,
             function: None,
             edit: Some(ShaderRowEdit {
                 path: block_path.clone(),
@@ -1646,6 +1654,7 @@ fn h2_legacy_animation_constant_row(
         value_cell: shader_value_cell(format!("value: {current}")),
         fill: material_numeric_row(),
         parameter_type: Some("animated scalar".to_owned()),
+        is_overridden: true,
         function: None,
         edit: Some(ShaderRowEdit {
             path: block_path.clone(),
@@ -1679,6 +1688,7 @@ fn h2_legacy_function_placeholder_row(
         },
         fill: material_function_row(),
         parameter_type: Some("function".to_owned()),
+        is_overridden: true,
         function: None,
         edit: None,
         context_menu: None,
@@ -1885,6 +1895,7 @@ fn h2_postprocess_constant_animation_row(
         },
         fill,
         parameter_type: Some(parameter_type.to_owned()),
+        is_overridden: false,
         function: None,
         edit,
         context_menu: None,
@@ -1917,6 +1928,7 @@ fn h2_missing_function_row(
             },
             fill: material_numeric_row(),
             parameter_type: Some("function".to_owned()),
+            is_overridden: false,
             function: None,
             edit: Some(ShaderRowEdit {
                 path: edit_path,
@@ -1940,6 +1952,7 @@ fn h2_missing_function_row(
         },
         fill: material_numeric_row(),
         parameter_type: Some("function".to_owned()),
+        is_overridden: false,
         function: None,
         edit: Some(ShaderRowEdit {
             path: edit_path,
@@ -2124,6 +2137,7 @@ fn h2_compact_parameter_row(
         },
         fill,
         parameter_type: Some(parameter_type_label.to_owned()),
+        is_overridden: true,
         function: None,
         edit,
         context_menu: None,
@@ -2167,6 +2181,7 @@ fn h2_raw_parameter_rows(root: TagStruct<'_>) -> Vec<ShaderGridRow> {
         },
         fill: material_data_row(),
         parameter_type: Some("count".to_owned()),
+        is_overridden: false,
         function: None,
         edit: None,
         context_menu: None,
@@ -2301,6 +2316,7 @@ fn h2_shader_row_from_field(
         },
         fill: material_row_tint(&value),
         parameter_type: Some(classic_shader_value_kind(&value).to_owned()),
+        is_overridden: false,
         function: None,
         edit,
         context_menu: None,
@@ -2485,6 +2501,7 @@ fn classic_shader_row_from_field(
         },
         fill: material_row_tint(&value),
         parameter_type: Some(classic_shader_value_kind(&value).to_owned()),
+        is_overridden: false,
         function: None,
         edit,
         context_menu: None,
@@ -2961,6 +2978,7 @@ fn empty_shader_grid_row() -> ShaderGridRow {
         },
         fill: material_data_row(),
         parameter_type: None,
+        is_overridden: false,
         function: None,
         edit: None,
         context_menu: None,
@@ -3674,6 +3692,7 @@ pub(super) fn shader_bitmap_row(
         },
         fill: material_ref_row(),
         parameter_type: Some("bitmap".to_owned()),
+        is_overridden: instance.is_some(),
         function: None,
         edit: shader_param_field_path(edit_prefix, param_index, "bitmap")
             .map(|path| ShaderRowEdit {
@@ -3832,6 +3851,7 @@ pub(super) fn shader_bitmap_expansion_rows(
                     )),
                     fill: material_numeric_row(),
                     parameter_type: Some("animated scalar".to_owned()),
+                    is_overridden: true,
                     function: None,
                     edit: if data_path.is_empty() {
                         None
@@ -3906,6 +3926,7 @@ pub(super) fn shader_scalar_row(
                     value_cell: shader_value_cell(format!("value: {current}")),
                     fill: material_numeric_row(),
                     parameter_type: Some("animated scalar".to_owned()),
+                    is_overridden: true,
                     function: None,
                     edit: if data_path.is_empty() {
                         None
@@ -3947,6 +3968,7 @@ pub(super) fn shader_scalar_row(
             value_cell: shader_value_cell(format!("value: {current}")),
             fill: material_numeric_row(),
             parameter_type: Some("real".to_owned()),
+            is_overridden: true,
             function: None,
             edit: Some(ShaderRowEdit {
                 path,
@@ -3980,6 +4002,7 @@ pub(super) fn shader_scalar_row(
         value_cell: shader_value_cell(format!("value: {current}")),
         fill: material_numeric_row(),
         parameter_type: Some("real".to_owned()),
+        is_overridden: false,
         function: None,
         edit,
         context_menu: None,
@@ -4004,6 +4027,7 @@ pub(super) fn shader_int_row(
         material_data_row(),
         Some("enum".to_owned()),
     );
+    row.is_overridden = instance.is_some();
     row.edit =
         shader_param_field_path(edit_prefix, param_index, "int/bool").map(|path| ShaderRowEdit {
             path,
@@ -4029,6 +4053,7 @@ pub(super) fn shader_bool_row(
         material_data_row(),
         Some("bool".to_owned()),
     );
+    row.is_overridden = instance.is_some();
     row.edit = shader_param_field_path(edit_prefix, param_index, "int/bool")
         .map(|path| ShaderRowEdit {
             path,
@@ -4168,6 +4193,7 @@ pub(super) fn shader_color_row(
                     },
                     fill: material_numeric_row(),
                     parameter_type: Some("color".to_owned()),
+                    is_overridden: true,
                     function: None,
                     edit: if data_path.is_empty() {
                         None
@@ -4211,6 +4237,7 @@ pub(super) fn shader_color_row(
             },
             fill: material_numeric_row(),
             parameter_type: Some("color".to_owned()),
+            is_overridden: true,
             function: None,
             edit: Some(ShaderRowEdit {
                 path,
@@ -4245,6 +4272,7 @@ pub(super) fn shader_color_row(
         },
         fill: material_numeric_row(),
         parameter_type: Some("color".to_owned()),
+        is_overridden: false,
         function: None,
         edit: color_field_path
             .map(|path| ShaderRowEdit {
@@ -4322,6 +4350,7 @@ pub(super) fn shader_alpha_row(
                     value_cell: shader_value_cell(format!("value: {current}")),
                     fill: material_numeric_row(),
                     parameter_type: Some("alpha".to_owned()),
+                    is_overridden: true,
                     function: None,
                     edit: if data_path.is_empty() {
                         None
@@ -4371,6 +4400,7 @@ pub(super) fn shader_alpha_row(
         value_cell: shader_value_cell(format!("value: {current}")),
         fill: material_numeric_row(),
         parameter_type: Some("alpha".to_owned()),
+        is_overridden: instance.is_some(),
         function: None,
         edit: Some(ShaderRowEdit {
             path: format!("create:{}_alpha", parameter.parameter_name),
@@ -4603,6 +4633,7 @@ pub(super) fn shader_sampler_enum_row(
         .cloned()
         .unwrap_or_else(|| current_index.to_string());
     let mut row = shader_option_value_row(label, default_label, current_label);
+    row.is_overridden = param_index.is_some();
     row.edit = shader_param_field_path(edit_prefix, param_index, field).map(|path| ShaderRowEdit {
         path,
         current: current_index.to_string(),
@@ -4632,6 +4663,7 @@ pub(super) fn shader_plain_value_row(
         },
         fill,
         parameter_type,
+        is_overridden: false,
         function: None,
         edit: None,
         context_menu: None,
@@ -4655,6 +4687,7 @@ pub(super) fn shader_function_grid_row(label: String, function: FunctionView) ->
         },
         fill: material_function_row(),
         parameter_type: Some("function".to_owned()),
+        is_overridden: true,
         function: Some(function),
         edit: None,
         context_menu: None,
@@ -4855,6 +4888,7 @@ pub(super) fn draw_shader_editor_model(
             },
             fill: material_data_row(),
             parameter_type: Some("string id".to_owned()),
+            is_overridden: true,
             function: None,
             edit: if mat_edit_path.is_empty() {
                 None
@@ -4883,6 +4917,7 @@ pub(super) fn draw_shader_editor_model(
             },
             fill: material_ref_row(),
             parameter_type: Some("tag reference".to_owned()),
+            is_overridden: true,
             function: None,
             edit: None,
             context_menu: None,
@@ -4903,6 +4938,7 @@ pub(super) fn draw_shader_editor_model(
             },
             fill: material_ref_row(),
             parameter_type: Some("tag reference".to_owned()),
+            is_overridden: true,
             function: None,
             edit: None,
             context_menu: None,
@@ -4932,6 +4968,7 @@ pub(super) fn draw_shader_editor_model(
                 },
                 fill: material_data_row(),
                 parameter_type: Some("option".to_owned()),
+                is_overridden: true,
                 function: None,
                 edit: None,
                 context_menu: None,
@@ -4976,8 +5013,9 @@ pub(super) fn draw_shader_category_row(
     edit: &mut FieldEditContext<'_>,
 ) {
     let available = ui.available_width().max(780.0);
-    let label_width = 230.0;
-    let value_width = (available - label_width - 24.0).max(240.0);
+    let label_width = shader_label_width(ui);
+    let default_width = 110.0;
+    let value_width = (available - label_width - default_width - 32.0).max(240.0);
     let height = 25.0;
     let (rect, _) = ui.allocate_exact_size(Vec2::new(available, height), Sense::hover());
     let row_fill = material_data_row();
@@ -4998,8 +5036,31 @@ pub(super) fn draw_shader_category_row(
         material_text_for_bg(row_fill),
     );
 
+    let default_rect = egui::Rect::from_min_size(
+        label_rect.right_top() + Vec2::new(2.0, 2.0),
+        Vec2::new(default_width, height - 4.0),
+    );
+    let default_text = category
+        .options
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "NONE".to_owned());
+    let default_cell = ShaderGridCell {
+        text: default_text,
+        value_kind: "default",
+        color: None,
+    };
+    let mut no_color_popup = None;
+    draw_shader_grid_cell(
+        ui,
+        default_rect,
+        Some(&default_cell),
+        &format!("category_default:{}", category.name),
+        &mut no_color_popup,
+    );
+
     let combo_rect = egui::Rect::from_min_size(
-        label_rect.right_top() + Vec2::new(8.0, 2.0),
+        default_rect.right_top() + Vec2::new(6.0, 0.0),
         Vec2::new(value_width, height - 4.0),
     );
     let selected_index = category.selected.max(0) as usize;
@@ -5080,6 +5141,7 @@ pub(super) fn draw_material_template_summary(
             value_cell: cell,
             fill: material_ref_row(),
             parameter_type: Some("tag reference".to_owned()),
+            is_overridden: true,
             function: None,
             edit: None,
             context_menu: None,
@@ -5230,6 +5292,7 @@ pub(super) fn shader_grid_row_from_parameter(
         value_cell,
         fill,
         parameter_type,
+        is_overridden: true,
         function,
         edit: None,
         context_menu: None,
@@ -5486,14 +5549,14 @@ pub(super) fn draw_shader_flags_row(
 /// rmop/template default (Phase 4.1 "differs-from-default" indicator).
 const SHADER_MODIFIED_ACCENT: Color32 = Color32::from_rgb(224, 158, 62);
 
-/// Whether a row's value differs from its default. Colors render identical text
-/// (`"color: RGB"`) so are compared by hex; an unoverridden row shows the
-/// `"Override Default"` placeholder and never counts as modified.
+/// Whether an explicitly overridden row's value differs from its default.
+/// Colors render identical text (`"color: RGB"`) so are compared by hex;
+/// inherited rows never count as modified.
 pub(super) fn row_differs_from_default(row: &ShaderGridRow) -> bool {
     let Some(default) = row.default_cell.as_ref() else {
         return false;
     };
-    if row.value_cell.text == "Override Default" {
+    if !row.is_overridden {
         return false;
     }
     match (row.value_cell.color.as_ref(), default.color.as_ref()) {
@@ -5502,30 +5565,160 @@ pub(super) fn row_differs_from_default(row: &ShaderGridRow) -> bool {
     }
 }
 
-/// A `PendingFieldEdit` that restores a row to its default, for simple
-/// scalar/int/string-id rows whose default is a plain (non-color, non-vector)
-/// value. `None` for colors/functions/bitmaps/etc. (no simple value reset).
-fn reset_edit_for_row(row: &ShaderGridRow) -> Option<PendingFieldEdit> {
+/// A `BlockOp` that clears a shader override by deleting the owning
+/// `parameters[n]` element. This is Foundation's ClearValue semantics: an
+/// explicit value equal to the default is still an override, so reset must
+/// remove the sparse parameter entry instead of writing the default value.
+fn reset_op_for_row(row: &ShaderGridRow) -> Option<BlockOp> {
+    if !row.is_overridden {
+        return None;
+    }
     let row_edit = row.edit.as_ref()?;
-    if !matches!(
+    if matches!(
         row_edit.kind,
-        ShaderRowEditKind::Scalar | ShaderRowEditKind::Int | ShaderRowEditKind::StringId
+        ShaderRowEditKind::CreateScalarParam { .. }
+            | ShaderRowEditKind::CreateFunctionColor { .. }
+            | ShaderRowEditKind::CreateFunctionScalar { .. }
+            | ShaderRowEditKind::H2CreateFunctionScalar { .. }
+            | ShaderRowEditKind::H2CreateFunctionColor { .. }
+            | ShaderRowEditKind::H2CreateTemplateValue { .. }
+            | ShaderRowEditKind::H2CreateTemplateColor { .. }
     ) {
         return None;
     }
-    let default = row.default_cell.as_ref()?;
-    if default.color.is_some() {
+    shader_parameter_delete_op_from_field_path(&row_edit.path)
+}
+
+fn shader_parameter_delete_op_from_field_path(path: &str) -> Option<BlockOp> {
+    let slash = path.rfind('/')?;
+    let parent = &path[..slash];
+    let open = parent.rfind('[')?;
+    let close = parent[open + 1..].find(']')? + open + 1;
+    if close + 1 != parent.len() {
         return None;
     }
-    let raw = default.text.trim();
-    if raw.starts_with("vector:") {
-        return None;
-    }
-    let input = raw.rsplit(": ").next().unwrap_or(raw).trim().to_owned();
-    (!input.is_empty()).then(|| PendingFieldEdit {
-        path: row_edit.path.clone(),
-        input,
+    let index = parent[open + 1..close].parse::<usize>().ok()?;
+    Some(BlockOp {
+        path: parent[..open].to_owned(),
+        kind: BlockOpKind::Delete(index),
     })
+}
+
+fn push_shader_override_create(edit: &mut FieldEditContext<'_>, row_edit: &ShaderRowEdit) -> bool {
+    match &row_edit.kind {
+        ShaderRowEditKind::BitmapRef { create, .. } => {
+            push_shader_value_edit(edit, row_edit, create.as_ref(), row_edit.current.clone());
+            create.is_some()
+        }
+        ShaderRowEditKind::Bool { create } => {
+            push_shader_value_edit(edit, row_edit, create.as_ref(), row_edit.current.clone());
+            create.is_some()
+        }
+        ShaderRowEditKind::CreateScalarParam {
+            parameters_block_path,
+            parameter_name,
+            parameter_type_index,
+        } => {
+            edit.shader_param_ops.push(ShaderParamOp {
+                parameters_block_path: parameters_block_path.clone(),
+                parameter_name: parameter_name.clone(),
+                initial_fields: vec![
+                    shader_parameter_type_initial_field(*parameter_type_index),
+                    ShaderParamInitialField {
+                        field: "real".to_owned(),
+                        input: row_edit.current.clone(),
+                    },
+                ],
+                animated_parameters: Vec::new(),
+            });
+            true
+        }
+        ShaderRowEditKind::CreateFunctionColor { target } => {
+            let rgba = parse_shader_rgba(&row_edit.current).unwrap_or([1.0, 1.0, 1.0, 1.0]);
+            push_shader_context_action(
+                edit,
+                &shader_function_action(
+                    target,
+                    constant_color_function_hex(rgba[0], rgba[1], rgba[2], rgba[3]),
+                ),
+            );
+            true
+        }
+        ShaderRowEditKind::CreateFunctionScalar { target } => {
+            let value = row_edit.current.trim().parse::<f32>().unwrap_or_default();
+            push_shader_context_action(
+                edit,
+                &shader_function_action(target, constant_function_hex(value)),
+            );
+            true
+        }
+        ShaderRowEditKind::H2CreateFunctionColor { create_op } => {
+            edit.h2_shader_param_ops.push(create_op.clone());
+            true
+        }
+        ShaderRowEditKind::H2CreateFunctionScalar { create_op } => {
+            let value = row_edit.current.trim().parse::<f32>().unwrap_or_default();
+            let mut op = create_op.clone();
+            if let H2ShaderParamOp::EnsureAnimationProperty {
+                initial_function_data,
+                ..
+            } = &mut op
+            {
+                *initial_function_data =
+                    decode_hex(&constant_function_hex(value)).unwrap_or_default();
+            }
+            edit.h2_shader_param_ops.push(op);
+            true
+        }
+        ShaderRowEditKind::H2CreateTemplateValue {
+            parameters_block_path,
+            parameter_name,
+            parameter_type_index,
+            field,
+        } => {
+            edit.h2_shader_param_ops
+                .push(H2ShaderParamOp::EditTemplateBackedValue {
+                    parameters_block_path: parameters_block_path.clone(),
+                    parameter_name: parameter_name.clone(),
+                    parameter_type_index: *parameter_type_index,
+                    field: field.clone(),
+                    input: h2_template_value_input(field, &row_edit.current),
+                });
+            true
+        }
+        ShaderRowEditKind::H2CreateTemplateColor {
+            parameters_block_path,
+            parameter_name,
+            parameter_type_index,
+            field,
+        } => {
+            let rgba = parse_shader_rgba(&row_edit.current).unwrap_or([0.0, 0.0, 0.0, 1.0]);
+            edit.h2_shader_param_ops
+                .push(H2ShaderParamOp::EditTemplateBackedValue {
+                    parameters_block_path: parameters_block_path.clone(),
+                    parameter_name: parameter_name.clone(),
+                    parameter_type_index: *parameter_type_index,
+                    field: field.clone(),
+                    input: format!("{}, {}, {}", rgba[0], rgba[1], rgba[2]),
+                });
+            true
+        }
+        _ => false,
+    }
+}
+
+fn parse_shader_rgba(input: &str) -> Option<[f32; 4]> {
+    let values = input
+        .split(',')
+        .map(str::trim)
+        .map(str::parse::<f32>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    match values.as_slice() {
+        [r, g, b] => Some([*r, *g, *b, 1.0]),
+        [r, g, b, a] => Some([*r, *g, *b, *a]),
+        _ => None,
+    }
 }
 
 /// Compare two grid-cell value texts, tolerating numeric formatting differences
@@ -5625,7 +5818,10 @@ pub(super) fn draw_shader_grid_row(
     if split_resp.hovered() || split_resp.dragged() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
         ui.painter().line_segment(
-            [egui::pos2(split_x, rect.top()), egui::pos2(split_x, rect.bottom())],
+            [
+                egui::pos2(split_x, rect.top()),
+                egui::pos2(split_x, rect.bottom()),
+            ],
             Stroke::new(1.0, row_text),
         );
     }
@@ -5649,14 +5845,56 @@ pub(super) fn draw_shader_grid_row(
     let value_left = default_rect.right() + 6.0;
     let controls_left = rect.right() - right_controls_width;
     let value_right = (controls_left - 4.0).max(value_left + 40.0);
-    let value_rect = egui::Rect::from_min_max(
+    let mut value_rect = egui::Rect::from_min_max(
         egui::pos2(value_left, default_rect.top()),
         egui::pos2(value_right, default_rect.bottom()),
     );
+    let reset = (editable && row.is_overridden)
+        .then(|| reset_op_for_row(row))
+        .flatten();
+    let reset_rect = reset.as_ref().map(|_| {
+        let rect = egui::Rect::from_min_size(
+            value_rect.right_top() - Vec2::new(20.0, 0.0),
+            Vec2::new(18.0, value_rect.height()),
+        );
+        value_rect.max.x = (rect.left() - 3.0).max(value_rect.left() + 40.0);
+        rect
+    });
 
     // Editable value cell when the row carries an edit path and the tag is
     // writable; otherwise the read-only painted cell.
-    if let (true, Some(row_edit)) = (editable, row.edit.as_ref()) {
+    if editable
+        && !row.is_overridden
+        && let Some(row_edit) = row.edit.as_ref()
+        && matches!(
+            row_edit.kind,
+            ShaderRowEditKind::BitmapRef {
+                create: Some(_),
+                ..
+            } | ShaderRowEditKind::Bool { create: Some(_) }
+                | ShaderRowEditKind::CreateScalarParam { .. }
+                | ShaderRowEditKind::CreateFunctionColor { .. }
+                | ShaderRowEditKind::CreateFunctionScalar { .. }
+                | ShaderRowEditKind::H2CreateFunctionScalar { .. }
+                | ShaderRowEditKind::H2CreateFunctionColor { .. }
+                | ShaderRowEditKind::H2CreateTemplateValue { .. }
+                | ShaderRowEditKind::H2CreateTemplateColor { .. }
+        )
+    {
+        ui.scope_builder(egui::UiBuilder::new().max_rect(value_rect), |ui| {
+            let response = ui.add_sized(
+                value_rect.size(),
+                egui::Button::new(RichText::new("Override Default").color(material_text()))
+                    .fill(material_pending_input()),
+            );
+            if response
+                .on_hover_text("Create an explicit override initialized from the default")
+                .clicked()
+            {
+                push_shader_override_create(edit, row_edit);
+            }
+        });
+    } else if let (true, Some(row_edit)) = (editable, row.edit.as_ref()) {
         draw_shader_editable_value(ui, value_rect, &row.label, row_edit, edit, color_popup);
     } else {
         draw_shader_grid_cell(
@@ -5666,6 +5904,29 @@ pub(super) fn draw_shader_grid_row(
             &format!("value:{}", row.label),
             color_popup,
         );
+    }
+    if let (Some(reset), Some(reset_rect)) = (reset, reset_rect) {
+        ui.painter().rect_filled(reset_rect, 0.0, material_input());
+        ui.painter()
+            .rect_stroke(reset_rect, 0.0, Stroke::new(1.0, material_input_edge()));
+        ui.painter().text(
+            reset_rect.center(),
+            Align2::CENTER_CENTER,
+            "×",
+            FontId::proportional(13.0),
+            material_delete_text(),
+        );
+        if ui
+            .interact(
+                reset_rect,
+                ui.make_persistent_id(format!("shader_override_clear:{}", row.label)),
+                Sense::click(),
+            )
+            .on_hover_text("Clear override and inherit the default")
+            .clicked()
+        {
+            edit.block_ops.push(reset);
+        }
     }
 
     let mut next_function_x = controls_left.max(value_rect.right() + 4.0);
@@ -5849,8 +6110,8 @@ pub(super) fn draw_shader_grid_row(
         }
     } else {
         // context_menu takes &self so call it first; on_hover_text takes self.
-        let reset = (editable && modified)
-            .then(|| reset_edit_for_row(row))
+        let reset = (editable && row.is_overridden)
+            .then(|| reset_op_for_row(row))
             .flatten();
         let menu_items = row
             .context_menu
@@ -5862,7 +6123,7 @@ pub(super) fn draw_shader_grid_row(
             response.context_menu(|ui| {
                 if let Some(reset) = reset.clone() {
                     if ui.button("Reset to default").clicked() {
-                        edit.pending.push(reset);
+                        edit.block_ops.push(reset);
                         ui.close_menu();
                     }
                 }
@@ -6456,7 +6717,11 @@ pub(super) fn draw_shader_editable_value(
                         texture.id(),
                         native * scale,
                     )));
-                    ui.label(RichText::new(&open_ref).small().color(material_muted_text()));
+                    ui.label(
+                        RichText::new(&open_ref)
+                            .small()
+                            .color(material_muted_text()),
+                    );
                 });
             }
             let text_rect = egui::Rect::from_min_size(
@@ -6511,8 +6776,8 @@ pub(super) fn draw_shader_editable_value(
                 *buffer = current.clone();
             }
             // Flag a referenced bitmap that is missing on disk (red text).
-            let missing = open_enabled
-                && reference_target_missing(edit.tags_root, *group_tag, &open_ref);
+            let missing =
+                open_enabled && reference_target_missing(edit.tags_root, *group_tag, &open_ref);
             let text_color = if missing {
                 REFERENCE_MISSING_COLOR
             } else {
@@ -6549,7 +6814,8 @@ pub(super) fn draw_shader_editable_value(
                     ui.make_persistent_id(("shader_bitmap_drop", &buffer_key)),
                     Sense::hover(),
                 );
-                let is_bitmap = |payload: &DraggedTagRef| &payload.group_tag.to_be_bytes() == b"bitm";
+                let is_bitmap =
+                    |payload: &DraggedTagRef| &payload.group_tag.to_be_bytes() == b"bitm";
                 if let Some(payload) = drop.dnd_hover_payload::<DraggedTagRef>() {
                     let color = if is_bitmap(&payload) {
                         Color32::from_rgb(120, 170, 90)
@@ -6561,7 +6827,8 @@ pub(super) fn draw_shader_editable_value(
                 }
                 if let Some(payload) = drop.dnd_release_payload::<DraggedTagRef>() {
                     if is_bitmap(&payload) {
-                        edit.buffers.insert(buffer_key.clone(), payload.rel_path.clone());
+                        edit.buffers
+                            .insert(buffer_key.clone(), payload.rel_path.clone());
                         push_shader_value_edit(
                             edit,
                             row_edit,
@@ -7726,13 +7993,15 @@ mod phase4_tests {
         let mut row = empty_shader_grid_row();
         row.default_cell = Some(cell("value: 1.0"));
         row.value_cell = cell("value: 1.0");
+        row.is_overridden = true;
         assert!(!row_differs_from_default(&row), "equal values don't differ");
         row.value_cell = cell("value: 2.0");
         assert!(row_differs_from_default(&row), "changed value differs");
         // numeric tolerance: "1" vs "1.0" are equal
         row.value_cell = cell("value: 1");
         assert!(!row_differs_from_default(&row));
-        // the "Override Default" placeholder never counts as modified
+        // inherited rows never count as modified, regardless of displayed text
+        row.is_overridden = false;
         row.value_cell = cell("Override Default");
         assert!(!row_differs_from_default(&row));
         // no default => never modified
@@ -7763,26 +8032,24 @@ mod phase4_tests {
     }
 
     #[test]
-    fn reset_edit_strips_prefix_for_scalar_only() {
+    fn reset_op_deletes_sparse_parameter_for_scalar_override() {
         let mut row = empty_shader_grid_row();
         row.default_cell = Some(cell("value: 0.5"));
+        row.is_overridden = true;
         row.edit = Some(ShaderRowEdit {
             path: "parameters[0]/value".to_owned(),
             current: "2.0".to_owned(),
             kind: ShaderRowEditKind::Scalar,
         });
-        let reset = reset_edit_for_row(&row).expect("scalar is resettable");
-        assert_eq!(reset.path, "parameters[0]/value");
-        assert_eq!(reset.input, "0.5");
-        // vectors are not reset (multi-component)
-        row.default_cell = Some(cell("vector: 1,2,3"));
-        assert!(reset_edit_for_row(&row).is_none());
+        let reset = reset_op_for_row(&row).expect("scalar override is clearable");
+        assert_eq!(reset.path, "parameters");
+        assert!(matches!(reset.kind, BlockOpKind::Delete(0)));
+        // inherited rows do not produce a clear op.
+        row.is_overridden = false;
+        assert!(reset_op_for_row(&row).is_none());
         // rows without an edit path can't reset
-        row.default_cell = Some(cell("value: 0.5"));
+        row.is_overridden = true;
         row.edit = None;
-        assert!(reset_edit_for_row(&row).is_none());
+        assert!(reset_op_for_row(&row).is_none());
     }
 }
-
-
-

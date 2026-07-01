@@ -607,18 +607,6 @@ pub(super) fn draw_entry_list(
 ) -> Option<BrowserAction> {
     let ordered = ordered_indices(entry_indices, entries, sort);
     let entry_indices: &[usize] = ordered.as_ref();
-    if filter.is_empty() && entry_indices.len() > MAX_BROWSER_ENTRIES_PER_NODE {
-        return draw_capped_entry_list(
-            ui,
-            entry_indices,
-            entries,
-            selected,
-            show_prefixes,
-            double_click_to_open,
-            reveal_key,
-        );
-    }
-
     let mut clicked = None;
     for &entry_index in entry_indices {
         let entry = &entries[entry_index];
@@ -630,59 +618,6 @@ pub(super) fn draw_entry_list(
         } else {
             let _ = draw_entry(ui, entry, selected, show_prefixes, double_click_to_open, reveal_key);
         }
-    }
-    clicked
-}
-
-pub(super) fn draw_capped_entry_list(
-    ui: &mut Ui,
-    entry_indices: &[usize],
-    entries: &[TagEntry],
-    selected: Option<&str>,
-    show_prefixes: bool,
-    double_click_to_open: bool,
-    reveal_key: Option<&str>,
-) -> Option<BrowserAction> {
-    let mut clicked = None;
-    let selected_index = selected.and_then(|selected| {
-        entry_indices
-            .iter()
-            .position(|&entry_index| entries[entry_index].key == selected)
-    });
-
-    for &entry_index in entry_indices.iter().take(MAX_BROWSER_ENTRIES_PER_NODE) {
-        let entry = &entries[entry_index];
-        if clicked.is_none() {
-            clicked = draw_entry(ui, entry, selected, show_prefixes, double_click_to_open, reveal_key);
-        } else {
-            let _ = draw_entry(ui, entry, selected, show_prefixes, double_click_to_open, reveal_key);
-        }
-    }
-
-    if let Some(position) = selected_index {
-        if position >= MAX_BROWSER_ENTRIES_PER_NODE {
-            ui.label(RichText::new("...").color(subtle_dark()));
-            let entry = &entries[entry_indices[position]];
-            if clicked.is_none() {
-                clicked = draw_entry(ui, entry, selected, show_prefixes, double_click_to_open, reveal_key);
-            } else {
-                let _ = draw_entry(ui, entry, selected, show_prefixes, double_click_to_open, reveal_key);
-            }
-        }
-    }
-
-    let shown = MAX_BROWSER_ENTRIES_PER_NODE.min(entry_indices.len())
-        + usize::from(
-            selected_index.is_some_and(|position| position >= MAX_BROWSER_ENTRIES_PER_NODE),
-        );
-    let hidden = entry_indices.len().saturating_sub(shown);
-    if hidden > 0 {
-        ui.label(
-            RichText::new(format!(
-                "... {hidden} more tags hidden here; use search to narrow"
-            ))
-            .color(subtle_dark()),
-        );
     }
     clicked
 }

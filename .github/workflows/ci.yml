@@ -7,6 +7,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # audiopus_sys vendors libopus and compiles it from source (statically linked
+  # into the binary — no runtime libopus needed). Its bundled CMakeLists targets
+  # an old CMake; allow the runners' modern CMake (4.x) to configure it.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 jobs:
   build:
@@ -31,6 +35,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev
+          # libasound2-dev: ALSA headers for rodio's Linux backend (cpal/alsa-sys).
+          # libopus is NOT needed — it's vendored + statically compiled.
+          sudo apt-get install -y libxkbcommon-dev libasound2-dev
 
       - run: cargo test --all-targets

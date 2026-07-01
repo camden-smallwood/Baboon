@@ -510,5 +510,4 @@ mod tests {
         );
     }
 }
-pub(super) const MAX_BROWSER_ENTRIES_PER_NODE: usize = 500;
 pub(super) const FOUNDATION_LABEL_WIDTH: f32 = 280.0;

@@ -6,6 +6,7 @@ pub(super) fn get_icon_svg(group_tag: &str) -> &'static str {
         "bipd" => include_str!("../../assets/icons/biped.svg"),
         "bitm" => include_str!("../../assets/icons/bitmap.svg"),
         "trak" => include_str!("../../assets/icons/camera_track.svg"),
+        "char" => include_str!("../../assets/icons/character.svg"),
         "gldf" | "chmt" => include_str!("../../assets/icons/chocolate_mountain.svg"),
         "coll" => include_str!("../../assets/icons/collision_model.svg"),
         "bloc" => include_str!("../../assets/icons/crate.svg"),
@@ -32,6 +33,7 @@ pub(super) fn get_icon_svg(group_tag: &str) -> &'static str {
         "shad" | "shdr" | "rmsh" => include_str!("../../assets/icons/shader.svg"),
         "sky " => include_str!("../../assets/icons/sky.svg"),
         "snd!" => include_str!("../../assets/icons/sound.svg"),
+        "styl" => include_str!("../../assets/icons/style.svg"),
         "vehi" => include_str!("../../assets/icons/vehicle.svg"),
         "weap" => include_str!("../../assets/icons/weapon.svg"),
         _ => include_str!("../../assets/icons/default_tag.svg"),
@@ -57,10 +59,12 @@ mod tests {
         assert!(get_icon_svg("bipd").contains("<svg"));
         assert!(get_icon_svg("shad").contains("<svg"));
         assert!(get_icon_svg("rmsh").contains("<svg"));
+        assert!(get_icon_svg("char").contains("<svg"));
         assert!(get_icon_svg("jpt!").contains("<svg"));
         assert!(get_icon_svg("lens").contains("<svg"));
         assert!(get_icon_svg("ligh").contains("<svg"));
         assert!(get_icon_svg("matg").contains("<svg"));
+        assert!(get_icon_svg("styl").contains("<svg"));
         assert!(get_icon_svg("unknown").contains("<svg"));
     }
 }

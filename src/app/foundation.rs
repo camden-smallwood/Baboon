@@ -1533,22 +1533,13 @@ pub(super) fn draw_foundation_block_control(
                         .width(combo_width),
                         |ui| {
                             selector_active |= ui.rect_contains_pointer(ui.max_rect());
-                            // Cap the rendered list for very large blocks.
-                            let cap = count.min(2000);
-                            for i in 0..cap {
+                            for i in 0..count {
                                 if ui
                                     .selectable_label(i == selected_index, element_label(i))
                                     .clicked()
                                 {
                                     actions.new_selection = Some(i);
                                 }
-                            }
-                            if cap < count {
-                                ui.label(
-                                    RichText::new(format!("… {} more", count - cap))
-                                        .small()
-                                        .color(subtle_dark()),
-                                );
                             }
                         },
                     );

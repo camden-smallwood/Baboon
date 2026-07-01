@@ -34,7 +34,7 @@ fn main() -> Result<()> {
 
 fn app_icon() -> Option<eframe::egui::IconData> {
     let image = image::load_from_memory_with_format(
-        include_bytes!("../icons/Baboon.ico"),
+        include_bytes!("../icon/baboon.ico"),
         image::ImageFormat::Ico,
     )
     .ok()?

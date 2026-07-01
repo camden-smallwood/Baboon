@@ -313,22 +313,22 @@ impl Baboon {
             blender_icon: load_ico_texture(
                 &cc.egui_ctx,
                 "blender_icon",
-                include_bytes!("../icons/blender.ico"),
+                include_bytes!("../assets/Quick access/blender.ico"),
             ),
             monitor_icon: load_ico_texture(
                 &cc.egui_ctx,
                 "monitor_icon",
-                include_bytes!("../icons/monitor.ico"),
+                include_bytes!("../assets/Quick access/monitor.ico"),
             ),
             sapien_icon: load_ico_texture(
                 &cc.egui_ctx,
                 "sapien_icon",
-                include_bytes!("../icons/sapien.ico"),
+                include_bytes!("../assets/Quick access/sapien.ico"),
             ),
             tag_test_icon: load_ico_texture(
                 &cc.egui_ctx,
                 "tag_test_icon",
-                include_bytes!("../icons/tag_test.ico"),
+                include_bytes!("../assets/Quick access/tag_test.ico"),
             ),
             game_banner_textures: HashMap::new(),
             block_clipboard: None,

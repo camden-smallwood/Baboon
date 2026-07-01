@@ -23,7 +23,7 @@ struct IconEntry {
 }
 
 fn main() {
-    println!("cargo:rerun-if-changed=icons/Baboon.ico");
+    println!("cargo:rerun-if-changed=icon/baboon.ico");
 
     copy_definitions_for_build().expect("copy blam-tags definitions");
 
@@ -32,7 +32,7 @@ fn main() {
     }
 
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let ico_path = manifest_dir.join("icons").join("Baboon.ico");
+    let ico_path = manifest_dir.join("icon").join("baboon.ico");
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let res_path = out_dir.join("Baboon.res");
 

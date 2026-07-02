@@ -18,7 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-blam-tags = { git = "https://github.com/camden-smallwood/blam-tags", rev = "c00a4cbe424c86ad69f009f2f41026bbc9e7d8ba", features = ["audio"] }
+blam-tags = { git = "https://github.com/camden-smallwood/blam-tags", rev = "5be44976fe1397453ed7d470483b9f69b58cefb4", features = ["audio"] }
 eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow"] }
 egui_extras = { version = "0.29", features = ["svg"] }
 flate2 = "1"
@@ -27,8 +27,3 @@ rfd = "0.15"
 rodio = { version = "0.20", default-features = false }
 serde_json = "1"
 walkdir = "2"
-
-# Local dev against the working engine tree (per-language sound bank/pck APIs).
-# DROP this + bump the `rev` above when shipping (engine commit → new hash).
-[patch."https://github.com/camden-smallwood/blam-tags"]
-blam-tags = { path = "/Users/camden/Source/blam-tags/blam-tags" }
